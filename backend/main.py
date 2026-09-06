@@ -1,8 +1,12 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import re
 import os
+from uuid import uuid4
+
+from transcription import TranscriptionServiceError, transcribe_audio
 
 app = FastAPI(title="FormVoice API")
 
@@ -23,6 +27,68 @@ app.add_middleware(
 class VoiceRequest(BaseModel):
     text: str
     current_form: dict
+
+
+def transcription_error(request_id: str, status_code: int, code: str, message: str):
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "request_id": request_id,
+            "error": {
+                "code": code,
+                "message": message,
+            },
+        },
+    )
+
+
+# -----------------------------
+# Speech-to-text endpoint
+# -----------------------------
+
+@app.post("/transcribe")
+async def transcribe(
+    audio: UploadFile | None = File(default=None),
+    language: str = Form(default="en"),
+):
+    """Transcribe one browser-recorded audio file without processing form fields."""
+    request_id = str(uuid4())
+
+    if audio is None:
+        return transcription_error(
+            request_id, 400, "AUDIO_REQUIRED", "Include an audio file in the 'audio' field."
+        )
+
+    content_type = audio.content_type or "application/octet-stream"
+    if not content_type.startswith("audio/"):
+        return transcription_error(
+            request_id, 415, "AUDIO_UNSUPPORTED", "Upload a supported audio file."
+        )
+
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        return transcription_error(
+            request_id, 400, "AUDIO_EMPTY", "The audio file is empty."
+        )
+
+    try:
+        text = await transcribe_audio(
+            audio_bytes=audio_bytes,
+            filename=audio.filename or "recording.webm",
+            content_type=content_type,
+            language=language,
+        )
+    except TranscriptionServiceError as error:
+        return transcription_error(request_id, error.status_code, error.code, error.message)
+
+    return {
+        "request_id": request_id,
+        "transcript": {
+            "text": text,
+            "language": language,
+            "confidence": None,
+        },
+    }
 
 
 # -----------------------------
