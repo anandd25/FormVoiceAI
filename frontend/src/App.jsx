@@ -1,900 +1,1762 @@
-import React, { useRef, useState } from "react";
+import React from "react";
+import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
-const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
-
-const initialForm = {
-  name: "",
-  dob: "",
-  phone: "",
-  email: "",
-  application_id: "",
-  pin: "",
-  address: "",
-  city: "",
-  state: "",
-  paragraph: "",
-};
-
-const fieldLabels = {
-  name: "Full Name",
-  dob: "Date of Birth",
-  phone: "Phone Number",
-  email: "Email Address",
-  application_id: "Application ID",
-  pin: "PIN Code",
-  address: "Address",
-  city: "City",
-  state: "State",
-  paragraph: "Additional Information",
-};
+const API = "http://localhost:8000";
 
 function App() {
-  const [form, setForm] = useState(initialForm);
+  const [screen, setScreen] = useState("home");
+
+  const [resume, setResume] = useState(null);
+  const [jobDescription, setJobDescription] = useState(null);
+
+  const [candidate, setCandidate] = useState(null);
+  const [job, setJob] = useState(null);
+
+  const [interviewStarted, setInterviewStarted] = useState(false);
+  const [interviewComplete, setInterviewComplete] = useState(false);
+
+  // NEW: backend interview ID
+  const [interviewId, setInterviewId] = useState(null);
+
+  const [currentQuestion, setCurrentQuestion] = useState("");
   const [transcript, setTranscript] = useState("");
-  const [message, setMessage] = useState("Ready to listen.");
-  const [status, setStatus] = useState("idle");
-  const [isRecording, setIsRecording] = useState(false);
+  const [conversation, setConversation] = useState([]);
 
-  const recorderRef = useRef(null);
+  const [status, setStatus] = useState("Ready");
+  const [isListening, setIsListening] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isEnding, setIsEnding] = useState(false);
+
+  const [report, setReport] = useState(null);
+
+  const [error, setError] = useState("");
+
+  const audioRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
-  const audioChunksRef = useRef([]);
+  const chunksRef = useRef([]);
 
-  // =====================================================
-  // PROCESS TRANSCRIPT → QWEN → JSON
-  // =====================================================
+  // ---------------------------------------------------------
+  // Upload handlers
+  // ---------------------------------------------------------
 
-  const processVoice = async (transcriptText) => {
-    try {
-      setStatus("processing");
-      setMessage("AI is understanding your information...");
+  const handleResume = (e) => {
+    const file = e.target.files?.[0];
 
-      const response = await fetch(
-        `${API_BASE_URL}/process-voice`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            transcript: transcriptText,
-          }),
-        }
-      );
+    if (!file) return;
 
-      const result = await response.json();
-
-      console.log("Qwen response:", result);
-
-      if (!response.ok) {
-        throw new Error(
-          result.detail ||
-            result.error ||
-            `Backend error: ${response.status}`
-        );
-      }
-
-      if (!result.success) {
-        throw new Error(
-          result.error ||
-            result.message ||
-            "AI processing failed."
-        );
-      }
-
-      setForm((previousForm) => ({
-        ...previousForm,
-        ...result.data,
-      }));
-
-      setMessage("✓ Form updated successfully.");
-      setStatus("success");
-
-    } catch (error) {
-      console.error("Processing error:", error);
-
-      setMessage(
-        error.message ||
-          "Could not process the transcript."
-      );
-
-      setStatus("error");
+    if (file.type !== "application/pdf") {
+      setError("Please upload your resume as a PDF.");
+      return;
     }
+
+    setResume(file);
+    setError("");
   };
 
-  // =====================================================
-  // AUDIO → GROQ WHISPER → TRANSCRIPT
-  // =====================================================
+  const handleJD = (e) => {
+    const file = e.target.files?.[0];
 
-  const uploadRecording = async (audioBlob) => {
+    if (!file) return;
+
+    if (
+      file.type !== "application/pdf" &&
+      !file.type.includes("text")
+    ) {
+      setError("Please upload a PDF or text job description.");
+      return;
+    }
+
+    setJobDescription(file);
+    setError("");
+  };
+
+  // ---------------------------------------------------------
+  // Analyze resume + JD
+  // ---------------------------------------------------------
+
+  const analyzeCandidate = async () => {
+    if (!resume || !jobDescription) {
+      setError("Please upload both resume and job description.");
+      return;
+    }
+
     try {
-      setStatus("transcribing");
-      setMessage("Transcribing your voice...");
+      setError("");
+      setStatus("Analyzing resume and job description...");
 
       const formData = new FormData();
 
+      formData.append("resume", resume);
+      formData.append("job_description", jobDescription);
+
+      const response = await fetch(`${API}/analyze`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error("Analysis failed");
+      }
+
+      const data = await response.json();
+
+      setCandidate(data.candidate || {});
+      setJob(data.job || {});
+
+      setScreen("analysis");
+      setStatus("Analysis complete");
+    } catch (err) {
+      console.error(err);
+
+      setError(
+        "Could not analyze the documents. Make sure the backend is running."
+      );
+
+      setStatus("Error");
+    }
+  };
+
+  // ---------------------------------------------------------
+  // Start interview
+  // ---------------------------------------------------------
+
+  const startInterview = async () => {
+    try {
+      setError("");
+
+      const stream =
+        await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+
+      streamRef.current = stream;
+
+      setInterviewStarted(true);
+      setInterviewComplete(false);
+      setScreen("interview");
+      setStatus("Connecting to recruiter...");
+
+      const response = await fetch(`${API}/start-interview`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          candidate,
+          job,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Interview could not start");
+      }
+
+      const data = await response.json();
+
       // IMPORTANT:
-      // Backend expects "file", NOT "audio"
+      // Store interview ID returned by backend
+      setInterviewId(data.interview_id || data.id || null);
+
+      const question =
+        data.question ||
+        "Hello. Let's begin your interview. Please introduce yourself.";
+
+      setCurrentQuestion(question);
+
+      setConversation([
+        {
+          type: "recruiter",
+          text: question,
+        },
+      ]);
+
+      if (data.audio) {
+        await playAudio(data.audio);
+      }
+
+      setStatus("Listening");
+
+      setTimeout(() => {
+        startRecording();
+      }, 400);
+    } catch (err) {
+      console.error(err);
+
+      stopMicrophone();
+
+      setError(
+        "Microphone permission is required to start the interview."
+      );
+
+      setStatus("Microphone error");
+    }
+  };
+
+  // ---------------------------------------------------------
+  // Rime audio
+  // ---------------------------------------------------------
+
+  const playAudio = async (base64Audio) => {
+    try {
+      setIsSpeaking(true);
+      setStatus("Recruiter speaking");
+
+      const audioSrc =
+        `data:audio/wav;base64,${base64Audio}`;
+
+      if (audioRef.current) {
+        audioRef.current.pause();
+      }
+
+      const audio = new Audio(audioSrc);
+
+      audioRef.current = audio;
+
+      await audio.play();
+
+      await new Promise((resolve) => {
+        audio.onended = resolve;
+      });
+
+      setIsSpeaking(false);
+    } catch (err) {
+      console.error("Audio playback error:", err);
+
+      setIsSpeaking(false);
+    }
+  };
+
+  // ---------------------------------------------------------
+  // Start recording
+  // ---------------------------------------------------------
+
+  const startRecording = () => {
+    if (!streamRef.current) return;
+
+    if (
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state === "recording"
+    ) {
+      return;
+    }
+
+    // Don't start recording after user has ended interview
+    if (!interviewStarted || interviewComplete || isEnding) {
+      return;
+    }
+
+    chunksRef.current = [];
+
+    let mimeType = "audio/webm";
+
+    if (!MediaRecorder.isTypeSupported("audio/webm")) {
+      mimeType = "";
+    }
+
+    const recorder = new MediaRecorder(
+      streamRef.current,
+      mimeType ? { mimeType } : undefined
+    );
+
+    mediaRecorderRef.current = recorder;
+
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        chunksRef.current.push(event.data);
+      }
+    };
+
+    recorder.onstop = async () => {
+      // Don't process an answer if interview was manually ended
+      if (isEnding) {
+        return;
+      }
+
+      const blob = new Blob(chunksRef.current, {
+        type: "audio/webm",
+      });
+
+      await processAnswer(blob);
+    };
+
+    recorder.start();
+
+    setIsListening(true);
+    setStatus("Listening");
+  };
+
+  // ---------------------------------------------------------
+  // Stop recording
+  // ---------------------------------------------------------
+
+  const stopRecording = () => {
+    if (
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state === "recording"
+    ) {
+      mediaRecorderRef.current.stop();
+
+      setIsListening(false);
+      setStatus("Understanding your answer...");
+    }
+  };
+
+  // ---------------------------------------------------------
+  // Process answer
+  // ---------------------------------------------------------
+
+  const processAnswer = async (audioBlob) => {
+    try {
+      // Don't process anything after manual end
+      if (isEnding || !interviewStarted) {
+        return;
+      }
+
+      setIsProcessing(true);
+
+      const formData = new FormData();
+
       formData.append(
         "file",
         audioBlob,
-        "recording.webm"
+        "answer.webm"
       );
 
-      const response = await fetch(
-        `${API_BASE_URL}/transcribe`,
+      // -----------------------------------------------------
+      // Speech to text
+      // -----------------------------------------------------
+
+      const transcriptionResponse = await fetch(
+        `${API}/transcribe`,
         {
           method: "POST",
           body: formData,
         }
       );
 
-      const result = await response.json();
+      if (!transcriptionResponse.ok) {
+        throw new Error("Transcription failed");
+      }
 
-      console.log("Transcription response:", result);
+      const transcription =
+        await transcriptionResponse.json();
+
+      const userText = transcription.text || "";
+
+      // Empty answer
+      if (!userText.trim()) {
+        setIsProcessing(false);
+        setStatus("Listening");
+
+        setTimeout(() => {
+          if (
+            interviewStarted &&
+            !interviewComplete &&
+            !isEnding
+          ) {
+            startRecording();
+          }
+        }, 500);
+
+        return;
+      }
+
+      setTranscript(userText);
+
+      // Save answer locally
+      setConversation((prev) => [
+        ...prev,
+        {
+          type: "candidate",
+          text: userText,
+        },
+      ]);
+
+      // -----------------------------------------------------
+      // Process answer
+      // -----------------------------------------------------
+
+      const response = await fetch(
+        `${API}/process-answer`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            interview_id: interviewId,
+            transcript: userText,
+            current_question: currentQuestion,
+            candidate,
+            job,
+            conversation,
+          }),
+        }
+      );
 
       if (!response.ok) {
         throw new Error(
-          result.detail ||
-            result.error ||
-            `Transcription error: ${response.status}`
+          "Answer processing failed"
         );
       }
 
-      if (!result.success) {
-        throw new Error(
-          result.error ||
-            "Transcription failed."
-        );
+      const data = await response.json();
+
+      // -----------------------------------------------------
+      // Interview completed automatically
+      // -----------------------------------------------------
+
+      if (data.complete) {
+        finishInterview(data);
+        return;
       }
 
-      const transcriptText =
-        result.transcript?.text || "";
+      // -----------------------------------------------------
+      // Next question
+      // -----------------------------------------------------
 
-      if (!transcriptText.trim()) {
-        throw new Error(
-          "No speech was detected. Please try again."
-        );
+      const nextQuestion =
+        data.question ||
+        data.next_question ||
+        "Thank you. Let's move to the next question.";
+
+      setCurrentQuestion(nextQuestion);
+
+      setConversation((prev) => [
+        ...prev,
+        {
+          type: "recruiter",
+          text: nextQuestion,
+        },
+      ]);
+
+      if (data.audio) {
+        await playAudio(data.audio);
       }
 
-      setTranscript(transcriptText);
+      setIsProcessing(false);
+      setStatus("Listening");
 
-      // Send transcript to Qwen
-      await processVoice(transcriptText);
+      // Automatically listen again
+      setTimeout(() => {
+        if (
+          interviewStarted &&
+          !interviewComplete &&
+          !isEnding
+        ) {
+          startRecording();
+        }
+      }, 400);
+    } catch (err) {
+      console.error(err);
 
-    } catch (error) {
-      console.error(
-        "Upload/transcription error:",
-        error
+      setError(
+        "There was a problem processing your answer."
       );
 
-      setMessage(
-        error.message ||
-          "Could not process your recording."
-      );
+      setIsProcessing(false);
 
-      setStatus("error");
+      if (!isEnding) {
+        setStatus("Listening");
+
+        setTimeout(() => {
+          if (
+            interviewStarted &&
+            !interviewComplete &&
+            !isEnding
+          ) {
+            startRecording();
+          }
+        }, 700);
+      }
     }
   };
 
-  // =====================================================
-  // START RECORDING
-  // =====================================================
+  // ---------------------------------------------------------
+  // FINISH INTERVIEW - automatic
+  // ---------------------------------------------------------
 
-  const startRecording = async () => {
+  const finishInterview = (data) => {
+    setInterviewComplete(true);
+    setInterviewStarted(false);
+    setIsEnding(false);
+
+    setReport(data.report || null);
+
+    setStatus("Interview complete");
+
+    stopMicrophone();
+
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+    }
+
+    setScreen("report");
+  };
+
+  // ---------------------------------------------------------
+  // NEW: MANUALLY END INTERVIEW
+  // ---------------------------------------------------------
+
+  const handleEndInterview = async () => {
+    if (isEnding) return;
+
+    const confirmed = window.confirm(
+      "Are you sure you want to end the interview?\n\nYour answers so far will be used to generate your recruiter report."
+    );
+
+    if (!confirmed) return;
+
     try {
-      if (!navigator.mediaDevices?.getUserMedia) {
-        throw new Error(
-          "Microphone access is not supported by this browser."
-        );
+      setIsEnding(true);
+      setStatus("Ending interview...");
+      setError("");
+
+      // Stop audio immediately
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.currentTime = 0;
       }
 
-      if (!window.MediaRecorder) {
-        throw new Error(
-          "MediaRecorder is not supported by this browser."
-        );
-      }
+      // Stop microphone immediately
+      stopMicrophone();
 
-      const stream =
-        await navigator.mediaDevices.getUserMedia({
-          audio: true,
-        });
+      setInterviewStarted(false);
 
-      streamRef.current = stream;
-      audioChunksRef.current = [];
+      // -----------------------------------------------------
+      // If we have an interview ID, ask backend for report
+      // -----------------------------------------------------
 
-      const recorder = new MediaRecorder(stream);
-
-      recorderRef.current = recorder;
-
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(
-            event.data
-          );
-        }
-      };
-
-      recorder.onstop = async () => {
-        const audioBlob = new Blob(
-          audioChunksRef.current,
+      if (interviewId) {
+        const response = await fetch(
+          `${API}/interview/${interviewId}/report`,
           {
-            type: "audio/webm",
+            method: "POST",
           }
         );
 
-        // Stop microphone
-        if (streamRef.current) {
-          streamRef.current
-            .getTracks()
-            .forEach((track) => track.stop());
+        if (!response.ok) {
+          throw new Error(
+            "Could not generate final report"
+          );
         }
 
-        streamRef.current = null;
+        const data = await response.json();
 
-        await uploadRecording(audioBlob);
-      };
+        setReport(
+          data.report ||
+          data ||
+          null
+        );
+      } else {
+        // Fallback if backend didn't return ID
+        console.warn(
+          "No interview_id returned by backend."
+        );
 
-      recorder.start();
+        setReport({
+          overall_score: 0,
+          technical_knowledge: 0,
+          problem_solving: 0,
+          communication: 0,
+          grammar: 0,
+          job_fit: 0,
+          confidence: 0,
+          verdict: "Interview ended early",
+          summary:
+            "The interview was manually ended before a complete interview report could be generated.",
+          strengths: [],
+          improvements: [
+            "Complete more interview questions for a more accurate assessment.",
+          ],
+        });
+      }
 
-      setIsRecording(true);
-      setStatus("recording");
-      setMessage("Listening... speak naturally.");
-
-    } catch (error) {
+      setInterviewComplete(true);
+      setScreen("report");
+      setStatus("Interview ended");
+    } catch (err) {
       console.error(
-        "Microphone error:",
-        error
+        "End interview error:",
+        err
       );
 
-      setMessage(
-        error.message ||
-          "Could not access your microphone."
+      setError(
+        "Interview ended, but the final report could not be generated."
       );
 
-      setStatus("error");
+      // Still show report screen
+      setInterviewComplete(true);
+      setScreen("report");
+      setStatus("Interview ended");
+    } finally {
+      setIsEnding(false);
     }
   };
 
-  // =====================================================
-  // STOP RECORDING
-  // =====================================================
+  // ---------------------------------------------------------
+  // Stop microphone
+  // ---------------------------------------------------------
 
-  const stopRecording = () => {
-    if (
-      recorderRef.current &&
-      recorderRef.current.state !== "inactive"
-    ) {
-      recorderRef.current.stop();
+  const stopMicrophone = () => {
+    if (mediaRecorderRef.current) {
+      if (
+        mediaRecorderRef.current.state ===
+        "recording"
+      ) {
+        mediaRecorderRef.current.stop();
+      }
+
+      mediaRecorderRef.current = null;
     }
 
-    setIsRecording(false);
-    setMessage("Processing your recording...");
-  };
+    if (streamRef.current) {
+      streamRef.current
+        .getTracks()
+        .forEach((track) => track.stop());
 
-  // =====================================================
-  // MAIN MICROPHONE
-  // =====================================================
-
-  const handleSpeak = () => {
-    if (isRecording) {
-      stopRecording();
-    } else {
-      startRecording();
+      streamRef.current = null;
     }
+
+    setIsListening(false);
   };
 
-  // =====================================================
-  // MANUAL FIELD EDIT
-  // =====================================================
+  // ---------------------------------------------------------
+  // Cleanup
+  // ---------------------------------------------------------
 
-  const handleChange = (field, value) => {
-    setForm((previousForm) => ({
-      ...previousForm,
-      [field]: value,
-    }));
-  };
+  useEffect(() => {
+    return () => {
+      stopMicrophone();
 
-  // =====================================================
-  // CLEAR
-  // =====================================================
+      if (audioRef.current) {
+        audioRef.current.pause();
+      }
+    };
+  }, []);
 
-  const clearForm = () => {
-    setForm(initialForm);
+  // ---------------------------------------------------------
+  // Reset
+  // ---------------------------------------------------------
+
+  const resetApp = () => {
+    stopMicrophone();
+
+    if (audioRef.current) {
+      audioRef.current.pause();
+    }
+
+    setResume(null);
+    setJobDescription(null);
+    setCandidate(null);
+    setJob(null);
+
+    setInterviewStarted(false);
+    setInterviewComplete(false);
+
+    setInterviewId(null);
+
+    setCurrentQuestion("");
     setTranscript("");
-    setMessage("Ready to listen.");
-    setStatus("idle");
+    setConversation([]);
+
+    setReport(null);
+    setError("");
+    setStatus("Ready");
+    setIsEnding(false);
+
+    setScreen("home");
   };
 
-  // =====================================================
-  // SUBMIT
-  // =====================================================
+  // =========================================================
+  // HOME SCREEN
+  // =========================================================
 
-  const handleSubmit = (event) => {
-    event.preventDefault();
+  if (screen === "home") {
+    return (
+      <div className="app">
+        <Navbar />
 
-    console.log(
-      "Final Form:",
-      form
-    );
+        <main className="hero">
+          <div className="hero-content">
 
-    setMessage(
-      "✓ Form submitted successfully."
-    );
-
-    setStatus("success");
-  };
-
-  // =====================================================
-  // PROGRESS
-  // =====================================================
-
-  const filledFields = Object.values(form).filter(
-    (value) =>
-      value &&
-      value.toString().trim() !== ""
-  ).length;
-
-  const progress =
-    (filledFields / Object.keys(form).length) * 100;
-
-  // =====================================================
-  // STATUS TEXT
-  // =====================================================
-
-  const getStatusText = () => {
-    switch (status) {
-      case "recording":
-        return "Listening...";
-      case "transcribing":
-        return "Transcribing...";
-      case "processing":
-        return "AI processing...";
-      case "success":
-        return "Ready";
-      case "error":
-        return "Something went wrong";
-      default:
-        return "Ready";
-    }
-  };
-
-  // =====================================================
-  // UI
-  // =====================================================
-
-  return (
-    <div className="app-shell">
-
-      {/* =================================================
-          HEADER
-      ================================================= */}
-
-      <header className="topbar">
-
-        <div className="brand-row">
-
-          <div className="brand-icon">
-            FV
-          </div>
-
-          <div>
-            <h1>FormVoice AI</h1>
-
-            <p>
-              Intelligent voice-powered form filling
-            </p>
-          </div>
-
-        </div>
-
-        <div className="ready-badge">
-
-          <span className="ready-dot"></span>
-
-          {getStatusText()}
-
-        </div>
-
-      </header>
-
-
-      {/* =================================================
-          MAIN DASHBOARD
-      ================================================= */}
-
-      <main className="dashboard">
-
-        {/* =================================================
-            LEFT PANEL
-        ================================================= */}
-
-        <section className="left-panel">
-
-          {/* VOICE CARD */}
-
-          <div className="voice-card">
-
-            <div className="eyebrow">
-              VOICE INPUT
+            <div className="badge">
+              <span className="badge-dot"></span>
+              AI VOICE RECRUITER
             </div>
 
-            <h2>
-              Speak. We'll handle the rest.
-            </h2>
+            <h1>
+              Your next interview,
+              <br />
+              <span>but actually intelligent.</span>
+            </h1>
 
-            <p>
-              Tell FormVoice your information naturally.
-              AI will transcribe your speech and
-              automatically organize it into the form.
+            <p className="hero-subtitle">
+              Upload your resume and the job description.
+              VoiceRecruit studies both and conducts a
+              personalized voice interview that adapts to
+              your answers.
             </p>
 
+            <div className="upload-grid">
 
-            {/* MICROPHONE ORB */}
+              <UploadCard
+                title="Your Resume"
+                description="Upload your latest resume"
+                file={resume}
+                accept=".pdf"
+                onChange={handleResume}
+                icon="📄"
+              />
 
-            <div
-              className={
-                isRecording
-                  ? "voice-orb listening"
-                  : "voice-orb"
+              <UploadCard
+                title="Job Description"
+                description="Upload the role you're applying for"
+                file={jobDescription}
+                accept=".pdf,.txt"
+                onChange={handleJD}
+                icon="💼"
+              />
+
+            </div>
+
+            {error && (
+              <div className="error-message">
+                ⚠️ {error}
+              </div>
+            )}
+
+            <button
+              className="primary-btn"
+              disabled={
+                !resume ||
+                !jobDescription
               }
+              onClick={analyzeCandidate}
             >
+              Analyze & Prepare Interview
+              <span>→</span>
+            </button>
 
-              <div className="voice-ring ring-one"></div>
-              <div className="voice-ring ring-two"></div>
-              <div className="voice-ring ring-three"></div>
+            <div className="trust-row">
+              <span>
+                🔒 Your documents stay private
+              </span>
 
-              <div className="mic-symbol">
-                🎤
+              <span>
+                ⚡ Personalized questions
+              </span>
+
+              <span>
+                🎙️ Natural voice interview
+              </span>
+            </div>
+
+          </div>
+        </main>
+      </div>
+    );
+  }
+
+  // =========================================================
+  // ANALYSIS SCREEN
+  // =========================================================
+
+  if (screen === "analysis") {
+    return (
+      <div className="app">
+        <Navbar />
+
+        <main className="dashboard">
+
+          <div className="page-heading">
+            <div>
+
+              <div className="eyebrow">
+                CANDIDATE ANALYSIS
+              </div>
+
+              <h2>
+                You're ready for the interview.
+              </h2>
+
+              <p>
+                We've compared your resume with the job
+                requirements and prepared a personalized
+                interview.
+              </p>
+
+            </div>
+          </div>
+
+          <div className="analysis-grid">
+
+            <section className="glass-card candidate-card">
+
+              <div className="card-header">
+                <span>👤</span>
+
+                <div>
+                  <h3>
+                    Candidate Profile
+                  </h3>
+
+                  <p>
+                    Extracted from your resume
+                  </p>
+                </div>
+              </div>
+
+              <div className="candidate-name">
+                {candidate?.name ||
+                  "Candidate"}
+              </div>
+
+              <div className="skill-list">
+
+                {(candidate?.skills || [
+                  "Python",
+                  "FastAPI",
+                  "React",
+                  "SQL",
+                ]).map(
+                  (skill, index) => (
+                    <span key={index}>
+                      {skill}
+                    </span>
+                  )
+                )}
+
+              </div>
+
+            </section>
+
+            <section className="glass-card">
+
+              <div className="card-header">
+                <span>🎯</span>
+
+                <div>
+                  <h3>
+                    Job Requirements
+                  </h3>
+
+                  <p>
+                    What the recruiter is looking for
+                  </p>
+                </div>
+              </div>
+
+              <div className="requirement-list">
+
+                {(job?.skills || [
+                  "Backend Development",
+                  "Python",
+                  "FastAPI",
+                  "REST APIs",
+                  "SQL",
+                  "Cloud",
+                ]).map(
+                  (skill, index) => (
+                    <div
+                      className="requirement"
+                      key={index}
+                    >
+                      <span>✓</span>
+                      {skill}
+                    </div>
+                  )
+                )}
+
+              </div>
+
+            </section>
+
+          </div>
+
+          <section className="glass-card interview-preview">
+
+            <div>
+
+              <div className="card-header">
+                <span>🧠</span>
+
+                <div>
+                  <h3>
+                    Interview Strategy
+                  </h3>
+
+                  <p>
+                    Questions will adapt based on your
+                    answers.
+                  </p>
+                </div>
+              </div>
+
+              <div className="strategy-grid">
+
+                <Strategy
+                  number="01"
+                  title="Resume Deep Dive"
+                  text="Questions about your projects and experience."
+                />
+
+                <Strategy
+                  number="02"
+                  title="Technical Assessment"
+                  text="Role-specific technical questions."
+                />
+
+                <Strategy
+                  number="03"
+                  title="Adaptive Follow-ups"
+                  text="Deeper questions based on your answers."
+                />
+
+                <Strategy
+                  number="04"
+                  title="Communication"
+                  text="Grammar, clarity and speaking quality."
+                />
+
               </div>
 
             </div>
 
-
-            {/* MAIN BUTTON */}
-
             <button
-              className={
-                isRecording
-                  ? "main-mic-button recording"
-                  : "main-mic-button"
-              }
-              onClick={handleSpeak}
+              className="primary-btn large"
+              onClick={startInterview}
             >
+              <span className="mic-icon">
+                🎙️
+              </span>
 
-              {isRecording
-                ? "⏹ Stop Recording"
-                : "🎤 Start Speaking"}
-
+              Start Voice Interview
             </button>
 
+          </section>
 
-            {/* WAVEFORM */}
+        </main>
+      </div>
+    );
+  }
 
-            {isRecording && (
-              <div className="wave-bars">
+  // =========================================================
+  // INTERVIEW SCREEN
+  // =========================================================
 
+  if (screen === "interview") {
+    return (
+      <div className="app interview-page">
+
+        <Navbar />
+
+        <main className="interview-layout">
+
+          <section className="interview-main">
+
+            <div className="interview-top">
+
+              <div>
+
+                <div className="eyebrow">
+                  LIVE INTERVIEW
+                </div>
+
+                <h2>
+                  VoiceRecruit
+                </h2>
+
+              </div>
+
+              <div className="live-indicator">
                 <span></span>
-                <span></span>
-                <span></span>
-                <span></span>
-                <span></span>
-                <span></span>
-                <span></span>
+                LIVE
+              </div>
+
+            </div>
+
+            <div className="recruiter-area">
+
+              <div
+                className={`recruiter-orb ${
+                  isSpeaking
+                    ? "speaking"
+                    : ""
+                } ${
+                  isListening
+                    ? "listening"
+                    : ""
+                }`}
+              >
+                <div className="orb-inner">
+                  🎙️
+                </div>
+              </div>
+
+              <div className="status-text">
+                {status}
+              </div>
+
+              <div className="question-card">
+
+                <div className="question-label">
+                  RECRUITER
+                </div>
+
+                <h3>
+                  {currentQuestion ||
+                    "Preparing your question..."}
+                </h3>
+
+              </div>
+
+              <div className="voice-status">
+
+                {isListening && (
+                  <>
+                    <div className="wave">
+
+                      <span></span>
+                      <span></span>
+                      <span></span>
+                      <span></span>
+                      <span></span>
+
+                    </div>
+
+                    <p>
+                      Listening to your answer...
+                    </p>
+                  </>
+                )}
+
+                {isProcessing && (
+                  <p>
+                    <span className="spinner"></span>
+                    Evaluating your response...
+                  </p>
+                )}
+
+                {isSpeaking && (
+                  <p>
+                    Recruiter is speaking...
+                  </p>
+                )}
+
+              </div>
+
+              <button
+                className={`record-button ${
+                  isListening
+                    ? "active"
+                    : ""
+                }`}
+                onClick={() => {
+
+                  if (isListening) {
+                    stopRecording();
+                  } else if (
+                    !isProcessing &&
+                    !isSpeaking &&
+                    !isEnding
+                  ) {
+                    startRecording();
+                  }
+
+                }}
+                disabled={
+                  isProcessing ||
+                  isSpeaking ||
+                  isEnding
+                }
+              >
+                <span>🎤</span>
+              </button>
+
+              <p className="record-hint">
+                {isListening
+                  ? "Tap to finish your answer"
+                  : "Speak naturally"}
+              </p>
+
+              {/* =================================================
+                  NEW END INTERVIEW BUTTON
+                 ================================================= */}
+
+              <button
+                className="end-interview-btn"
+                onClick={handleEndInterview}
+                disabled={isEnding}
+              >
+                {isEnding ? (
+                  <>
+                    <span className="spinner"></span>
+                    Ending Interview...
+                  </>
+                ) : (
+                  <>
+                    🔴 End Interview
+                  </>
+                )}
+              </button>
+
+              <p className="end-interview-hint">
+                You can end the interview at any time.
+              </p>
+
+              {error && (
+                <div className="error-message">
+                  ⚠️ {error}
+                </div>
+              )}
+
+            </div>
+
+          </section>
+
+          <aside className="conversation-panel">
+
+            <div className="panel-header">
+
+              <div>
+
+                <h3>
+                  Interview
+                </h3>
+
+                <p>
+                  Personalized for your application
+                </p>
+
+              </div>
+
+              <div className="question-count">
+
+                {conversation.filter(
+                  (x) =>
+                    x.type ===
+                    "recruiter"
+                ).length}
+
+              </div>
+
+            </div>
+
+            <div className="conversation">
+
+              {conversation.map(
+                (message, index) => (
+                  <div
+                    key={index}
+                    className={`message ${
+                      message.type
+                    }`}
+                  >
+
+                    <div className="message-role">
+
+                      {message.type ===
+                      "recruiter"
+                        ? "RECRUITER"
+                        : "YOU"}
+
+                    </div>
+
+                    <p>
+                      {message.text}
+                    </p>
+
+                  </div>
+                )
+              )}
+
+            </div>
+
+            {transcript && (
+              <div className="latest-answer">
+
+                <div className="message-role">
+                  LATEST ANSWER
+                </div>
+
+                <p>
+                  {transcript}
+                </p>
 
               </div>
             )}
 
-          </div>
+          </aside>
 
+        </main>
 
-          {/* AI ASSISTANT CARD */}
+      </div>
+    );
+  }
 
-          <div className="assistant-card">
+  // =========================================================
+  // REPORT SCREEN
+  // =========================================================
 
-            <div className="assistant-header">
+  if (screen === "report") {
+    return (
+      <div className="app">
 
-              <div className="assistant-icon">
-                ✨
-              </div>
+        <Navbar />
 
-              <div>
+        <main className="report-page">
 
-                <span>
-                  AI ASSISTANT
-                </span>
+          <div className="report-heading">
 
-                <strong>
-                  Qwen Intelligence
-                </strong>
-
-              </div>
-
+            <div className="eyebrow">
+              INTERVIEW COMPLETE
             </div>
 
+            <h2>
+              Your Recruiter Report
+            </h2>
+
             <p>
-              Your speech is converted into structured
-              information using AI instead of
-              rule-based field extraction.
+              Here's how you performed across technical
+              knowledge, communication and job fit.
             </p>
 
           </div>
 
-
-          {/* TRANSCRIPT CARD */}
-
-          <div className="transcript-card">
-
-            <div className="transcript-title">
-              📝 Latest Transcript
-            </div>
-
-            <p>
-              {transcript ||
-                "Your latest voice transcription will appear here."}
-            </p>
-
-          </div>
-
-        </section>
-
-
-        {/* =================================================
-            FORM PANEL
-        ================================================= */}
-
-        <section className="form-card">
-
-          <div className="form-heading">
+          <div className="overall-card">
 
             <div>
 
-              <div className="eyebrow">
-                SMART FORM
+              <div className="small-label">
+                OVERALL SCORE
               </div>
 
-              <h2>
-                Your Information
-              </h2>
+              <div className="overall-score">
+
+                {report?.overall_score ?? 0}
+
+                <span>
+                  /100
+                </span>
+
+              </div>
+
+            </div>
+
+            <div className="verdict">
+
+              <span>
+                RECRUITER VERDICT
+              </span>
+
+              <strong>
+                {report?.verdict ||
+                  "Interview ended"}
+              </strong>
 
               <p>
-                Review and edit anything before submitting.
+                {report?.summary ||
+                  "Your interview has been completed."}
               </p>
 
             </div>
 
-            <div className="progress-count">
-              {filledFields}/10
-            </div>
+          </div>
+
+          <div className="metrics-grid">
+
+            <Metric
+              title="Technical Knowledge"
+              value={
+                report?.technical_knowledge ?? 0
+              }
+              icon="🧠"
+            />
+
+            <Metric
+              title="Problem Solving"
+              value={
+                report?.problem_solving ?? 0
+              }
+              icon="💡"
+            />
+
+            <Metric
+              title="Communication"
+              value={
+                report?.communication ?? 0
+              }
+              icon="💬"
+            />
+
+            <Metric
+              title="Grammar"
+              value={
+                report?.grammar ?? 0
+              }
+              icon="✍️"
+            />
+
+            <Metric
+              title="Job Fit"
+              value={
+                report?.job_fit ?? 0
+              }
+              icon="🎯"
+            />
+
+            <Metric
+              title="Confidence"
+              value={
+                report?.confidence ?? 0
+              }
+              icon="🎙️"
+            />
 
           </div>
 
+          <div className="report-grid">
 
-          {/* PROGRESS */}
+            <section className="glass-card">
 
-          <div className="progress-track">
+              <div className="card-header">
 
-            <div
-              className="progress-fill"
-              style={{
-                width: `${progress}%`,
-              }}
-            ></div>
+                <span>💪</span>
+
+                <div>
+
+                  <h3>
+                    Strengths
+                  </h3>
+
+                  <p>
+                    What you did well
+                  </p>
+
+                </div>
+
+              </div>
+
+              <div className="feedback-list positive">
+
+                {(report?.strengths || [
+                  "Complete more questions to receive detailed feedback",
+                ]).map(
+                  (item, index) => (
+                    <div key={index}>
+                      <span>✓</span>
+                      {item}
+                    </div>
+                  )
+                )}
+
+              </div>
+
+            </section>
+
+            <section className="glass-card">
+
+              <div className="card-header">
+
+                <span>📈</span>
+
+                <div>
+
+                  <h3>
+                    Areas to Improve
+                  </h3>
+
+                  <p>
+                    Where you can get better
+                  </p>
+
+                </div>
+
+              </div>
+
+              <div className="feedback-list improvement">
+
+                {(report?.improvements || [
+                  "Complete more interview questions for a more accurate assessment.",
+                ]).map(
+                  (item, index) => (
+                    <div key={index}>
+                      <span>!</span>
+                      {item}
+                    </div>
+                  )
+                )}
+
+              </div>
+
+            </section>
 
           </div>
 
-          <p className="progress-text">
-            {filledFields === 0
-              ? "Start speaking to fill your form"
-              : `${filledFields} of 10 fields completed`}
-          </p>
+          <section className="glass-card detailed-analysis">
 
+            <div className="card-header">
 
-          {/* FORM */}
+              <span>📊</span>
 
-          <form onSubmit={handleSubmit}>
+              <div>
 
-            <div className="form-grid">
+                <h3>
+                  Communication Analysis
+                </h3>
 
-              {/* NAME */}
-
-              <div className="field-group">
-
-                <label>
-                  {fieldLabels.name}
-                </label>
-
-                <div className="voice-input-wrapper">
-
-                  <input
-                    type="text"
-                    value={form.name}
-                    onChange={(e) =>
-                      handleChange(
-                        "name",
-                        e.target.value
-                      )
-                    }
-                    placeholder="e.g. Anand Kumar"
-                  />
-
-                </div>
-
-              </div>
-
-
-              {/* DOB */}
-
-              <div className="field-group">
-
-                <label>
-                  {fieldLabels.dob}
-                </label>
-
-                <div className="voice-input-wrapper">
-
-                  <input
-                    type="text"
-                    value={form.dob}
-                    onChange={(e) =>
-                      handleChange(
-                        "dob",
-                        e.target.value
-                      )
-                    }
-                    placeholder="DD/MM/YYYY"
-                  />
-
-                </div>
-
-              </div>
-
-
-              {/* PHONE */}
-
-              <div className="field-group">
-
-                <label>
-                  {fieldLabels.phone}
-                </label>
-
-                <div className="voice-input-wrapper">
-
-                  <input
-                    type="text"
-                    value={form.phone}
-                    onChange={(e) =>
-                      handleChange(
-                        "phone",
-                        e.target.value
-                      )
-                    }
-                    placeholder="9876543210"
-                  />
-
-                </div>
-
-              </div>
-
-
-              {/* EMAIL */}
-
-              <div className="field-group">
-
-                <label>
-                  {fieldLabels.email}
-                </label>
-
-                <div className="voice-input-wrapper">
-
-                  <input
-                    type="email"
-                    value={form.email}
-                    onChange={(e) =>
-                      handleChange(
-                        "email",
-                        e.target.value
-                      )
-                    }
-                    placeholder="you@example.com"
-                  />
-
-                </div>
-
-              </div>
-
-
-              {/* APPLICATION ID */}
-
-              <div className="field-group">
-
-                <label>
-                  {fieldLabels.application_id}
-                </label>
-
-                <div className="voice-input-wrapper">
-
-                  <input
-                    type="text"
-                    value={form.application_id}
-                    onChange={(e) =>
-                      handleChange(
-                        "application_id",
-                        e.target.value
-                      )
-                    }
-                    placeholder="ABX2047891"
-                  />
-
-                </div>
-
-              </div>
-
-
-              {/* PIN */}
-
-              <div className="field-group">
-
-                <label>
-                  {fieldLabels.pin}
-                </label>
-
-                <div className="voice-input-wrapper">
-
-                  <input
-                    type="text"
-                    value={form.pin}
-                    onChange={(e) =>
-                      handleChange(
-                        "pin",
-                        e.target.value
-                      )
-                    }
-                    placeholder="411007"
-                  />
-
-                </div>
-
-              </div>
-
-
-              {/* ADDRESS */}
-
-              <div className="field-group full-width">
-
-                <label>
-                  {fieldLabels.address}
-                </label>
-
-                <div className="voice-input-wrapper">
-
-                  <input
-                    type="text"
-                    value={form.address}
-                    onChange={(e) =>
-                      handleChange(
-                        "address",
-                        e.target.value
-                      )
-                    }
-                    placeholder="House number, street, area"
-                  />
-
-                </div>
-
-              </div>
-
-
-              {/* CITY */}
-
-              <div className="field-group">
-
-                <label>
-                  {fieldLabels.city}
-                </label>
-
-                <div className="voice-input-wrapper">
-
-                  <input
-                    type="text"
-                    value={form.city}
-                    onChange={(e) =>
-                      handleChange(
-                        "city",
-                        e.target.value
-                      )
-                    }
-                    placeholder="Pune"
-                  />
-
-                </div>
-
-              </div>
-
-
-              {/* STATE */}
-
-              <div className="field-group">
-
-                <label>
-                  {fieldLabels.state}
-                </label>
-
-                <div className="voice-input-wrapper">
-
-                  <input
-                    type="text"
-                    value={form.state}
-                    onChange={(e) =>
-                      handleChange(
-                        "state",
-                        e.target.value
-                      )
-                    }
-                    placeholder="Maharashtra"
-                  />
-
-                </div>
-
-              </div>
-
-
-              {/* PARAGRAPH */}
-
-              <div className="field-group full-width">
-
-                <label>
-                  {fieldLabels.paragraph}
-                </label>
-
-                <div className="voice-input-wrapper">
-
-                  <textarea
-                    value={form.paragraph}
-                    onChange={(e) =>
-                      handleChange(
-                        "paragraph",
-                        e.target.value
-                      )
-                    }
-                    placeholder="Any additional information..."
-                    rows="5"
-                  />
-
-                </div>
+                <p>
+                  How effectively you communicated
+                </p>
 
               </div>
 
             </div>
 
+            <div className="communication-bars">
 
-            {/* ACTIONS */}
+              <ScoreBar
+                label="Grammar"
+                value={
+                  report?.grammar ?? 0
+                }
+              />
 
-            <div className="form-actions">
+              <ScoreBar
+                label="Clarity"
+                value={
+                  report?.clarity ?? 0
+                }
+              />
 
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={clearForm}
-              >
-                Clear Form
-              </button>
+              <ScoreBar
+                label="Vocabulary"
+                value={
+                  report?.vocabulary ?? 0
+                }
+              />
 
-              <button
-                type="submit"
-                className="submit-button"
-              >
-                Submit Form →
-              </button>
+              <ScoreBar
+                label="Professional Tone"
+                value={
+                  report?.professional_tone ?? 0
+                }
+              />
+
+              <ScoreBar
+                label="Answer Structure"
+                value={
+                  report?.answer_structure ?? 0
+                }
+              />
 
             </div>
 
-          </form>
+          </section>
 
-        </section>
+          <section className="glass-card speech-analysis">
 
-      </main>
+            <div className="card-header">
+
+              <span>🎙️</span>
+
+              <div>
+
+                <h3>
+                  Voice Analysis
+                </h3>
+
+                <p>
+                  Insights from your spoken responses
+                </p>
+
+              </div>
+
+            </div>
+
+            <div className="speech-stats">
+
+              <SpeechStat
+                value={
+                  report?.speaking_pace ?? "—"
+                }
+                unit="WPM"
+                label="Speaking Pace"
+              />
+
+              <SpeechStat
+                value={
+                  report?.filler_words ?? "—"
+                }
+                unit=""
+                label="Filler Words"
+              />
+
+              <SpeechStat
+                value={
+                  report?.long_pauses ?? "—"
+                }
+                unit=""
+                label="Long Pauses"
+              />
+
+              <SpeechStat
+                value={
+                  report?.answer_completion ?? "—"
+                }
+                unit="%"
+                label="Answer Completion"
+              />
+
+            </div>
+
+          </section>
+
+          <div className="report-actions">
+
+            <button
+              className="secondary-btn"
+              onClick={resetApp}
+            >
+              ← Start New Interview
+            </button>
+
+            <button
+              className="primary-btn"
+              onClick={() =>
+                window.print()
+              }
+            >
+              Download Report
+              <span>↓</span>
+            </button>
+
+          </div>
+
+        </main>
+
+      </div>
+    );
+  }
+
+  return null;
+}
+
+// =========================================================
+// COMPONENTS
+// =========================================================
+
+function Navbar() {
+  return (
+    <header className="navbar">
+
+      <div className="logo">
+
+        <div className="logo-mark">
+          V
+        </div>
+
+        <span>
+          VoiceRecruit
+        </span>
+
+      </div>
+
+      <div className="nav-right">
+        <span>
+          AI-Powered Recruitment
+        </span>
+      </div>
+
+    </header>
+  );
+}
+
+function UploadCard({
+  title,
+  description,
+  file,
+  accept,
+  onChange,
+  icon,
+}) {
+  return (
+    <label className="upload-card">
+
+      <input
+        type="file"
+        accept={accept}
+        onChange={onChange}
+        hidden
+      />
+
+      <div className="upload-icon">
+        {file ? "✓" : icon}
+      </div>
+
+      <div className="upload-info">
+
+        <h3>
+          {title}
+        </h3>
+
+        <p>
+          {file
+            ? file.name
+            : description}
+        </p>
+
+      </div>
+
+      <span className="upload-arrow">
+        {file ? "✓" : "+"}
+      </span>
+
+    </label>
+  );
+}
+
+function Strategy({
+  number,
+  title,
+  text,
+}) {
+  return (
+    <div className="strategy-item">
+
+      <span>
+        {number}
+      </span>
+
+      <div>
+
+        <strong>
+          {title}
+        </strong>
+
+        <p>
+          {text}
+        </p>
+
+      </div>
+
+    </div>
+  );
+}
+
+function Metric({
+  title,
+  value,
+  icon,
+}) {
+  const safeValue = Math.max(
+    0,
+    Math.min(100, Number(value) || 0)
+  );
+
+  return (
+    <div className="metric-card">
+
+      <div className="metric-icon">
+        {icon}
+      </div>
+
+      <div className="metric-title">
+        {title}
+      </div>
+
+      <div className="metric-value">
+
+        {safeValue}
+
+        <span>
+          /100
+        </span>
+
+      </div>
+
+      <div className="metric-progress">
+
+        <div
+          style={{
+            width: `${safeValue}%`,
+          }}
+        />
+
+      </div>
+
+    </div>
+  );
+}
+
+function ScoreBar({
+  label,
+  value,
+}) {
+  const safeValue = Math.max(
+    0,
+    Math.min(100, Number(value) || 0)
+  );
+
+  return (
+    <div className="score-row">
+
+      <div className="score-label">
+
+        <span>
+          {label}
+        </span>
+
+        <strong>
+          {safeValue}
+        </strong>
+
+      </div>
+
+      <div className="score-track">
+
+        <div
+          style={{
+            width: `${safeValue}%`,
+          }}
+        />
+
+      </div>
+
+    </div>
+  );
+}
+
+function SpeechStat({
+  value,
+  unit,
+  label,
+}) {
+  return (
+    <div className="speech-stat">
+
+      <strong>
+
+        {value}
+
+        <small>
+          {unit}
+        </small>
+
+      </strong>
+
+      <span>
+        {label}
+      </span>
 
     </div>
   );

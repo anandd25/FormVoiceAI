@@ -1,17 +1,51 @@
+# ============================================================
+# VOICERECRUIT - FINAL MAIN.PY
+# ============================================================
+#
+# LLM       : Groq - Llama 3.3 70B
+# STT       : Groq - Whisper Large V3 Turbo
+# TTS       : Rime - Coda
+# FRAMEWORK : FastAPI
+# ORCHESTRATION : LangChain
+#
+# ENVIRONMENT:
+#
+# GROQ_API_KEY=...
+# RIME_API_KEY=...
+#
+# NO HUGGING FACE REQUIRED
+#
+# ============================================================
+
 import os
-import json
 import re
+import json
+import base64
 import uuid
 import tempfile
-from typing import Optional
+from typing import Any, Dict, List, Optional
+
+import requests
 
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    HTTPException
+)
 
-from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
+from fastapi.middleware.cors import CORSMiddleware
+
+from pydantic import BaseModel, Field
+
+from pypdf import PdfReader
+
+from groq import Groq
+
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
 
 
 # ============================================================
@@ -20,24 +54,44 @@ from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
 
 load_dotenv()
 
-HF_TOKEN = os.getenv("HF_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-if not HF_TOKEN:
-    print("WARNING: HF_TOKEN is not set.")
-
-if not GROQ_API_KEY:
-    print("WARNING: GROQ_API_KEY is not set.")
+RIME_API_KEY = os.getenv("RIME_API_KEY")
 
 
 # ============================================================
-# FASTAPI APP
+# CONFIGURATION
+# ============================================================
+
+# Groq LLM
+GROQ_LLM_MODEL = os.getenv(
+    "GROQ_LLM_MODEL",
+    "openai/gpt-oss-120b"
+)
+
+# Groq Speech-to-Text
+WHISPER_MODEL = "whisper-large-v3-turbo"
+
+# Rime
+RIME_MODEL = "coda"
+RIME_SPEAKER = "celeste"
+
+RIME_URL = "https://users.rime.ai/v1/rime-tts"
+
+# Interview length
+MAX_QUESTIONS = 8
+
+
+# ============================================================
+# FASTAPI
 # ============================================================
 
 app = FastAPI(
-    title="FormVoice AI API",
-    description="Voice-native form filling using Groq Whisper and Qwen",
-    version="1.0.0"
+    title="VoiceRecruit",
+    description=(
+        "AI Voice Recruiter powered by "
+        "Groq, LangChain and Rime"
+    ),
+    version="6.0.0"
 )
 
 
@@ -47,365 +101,267 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+    ],
+
     allow_credentials=True,
+
     allow_methods=["*"],
+
     allow_headers=["*"],
 )
 
 
 # ============================================================
-# HUGGING FACE + QWEN
+# CLIENTS
 # ============================================================
 
-if HF_TOKEN:
-
-    llm = HuggingFaceEndpoint(
-        repo_id="Qwen/Qwen2.5-72B-Instruct",
-        huggingfacehub_api_token=HF_TOKEN,
-        temperature=0.1,
-        max_new_tokens=4096
-    )
-
-    model = ChatHuggingFace(
-        llm=llm
-    )
-
-else:
-    llm = None
-    model = None
+groq_client = None
 
 
-# ============================================================
-# FORM STRUCTURE
-# ============================================================
-
-FORM_FIELDS = [
-    "name",
-    "dob",
-    "phone",
-    "email",
-    "application_id",
-    "pin",
-    "address",
-    "city",
-    "state",
-    "paragraph"
-]
-
-
-# ============================================================
-# REQUEST MODELS
-# ============================================================
-
-class VoiceRequest(BaseModel):
-    transcript: str
-
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
-@app.get("/")
-def root():
-    return {
-        "success": True,
-        "message": "FormVoice AI backend is running",
-        "services": {
-            "transcription": "Groq Whisper",
-            "structured_extraction": "Qwen/Qwen2.5-72B-Instruct"
-        }
-    }
-
-
-# ============================================================
-# TRANSCRIPTION
-# ============================================================
-
-@app.post("/transcribe")
-async def transcribe_audio(file: UploadFile = File(...)):
-    """
-    Receives microphone audio and converts it into text.
-
-    Frontend:
-        audio file
-            ↓
-        /transcribe
-            ↓
-        transcript
-    """
-
-    if not GROQ_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="GROQ_API_KEY is not configured."
-        )
-
-    if not file:
-        raise HTTPException(
-            status_code=400,
-            detail="No audio file received."
-        )
-
-    # --------------------------------------------------------
-    # Save uploaded audio temporarily
-    # --------------------------------------------------------
-
-    extension = ".webm"
-
-    if file.filename:
-        original_extension = os.path.splitext(file.filename)[1]
-
-        if original_extension:
-            extension = original_extension
-
-    temp_path = None
+if GROQ_API_KEY:
 
     try:
 
-        audio_bytes = await file.read()
-
-        if not audio_bytes:
-            raise HTTPException(
-                status_code=400,
-                detail="Uploaded audio file is empty."
-            )
-
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=extension
-        ) as temp_file:
-
-            temp_file.write(audio_bytes)
-            temp_path = temp_file.name
-
-        # ----------------------------------------------------
-        # Groq Whisper
-        # ----------------------------------------------------
-
-        from groq import Groq
-
-        client = Groq(
+        groq_client = Groq(
             api_key=GROQ_API_KEY
         )
 
-        with open(temp_path, "rb") as audio_file:
-
-            transcription = client.audio.transcriptions.create(
-                file=audio_file,
-                model="whisper-large-v3-turbo",
-                response_format="verbose_json"
-            )
-
-        # ----------------------------------------------------
-        # Extract transcript
-        # ----------------------------------------------------
-
-        transcript_text = getattr(
-            transcription,
-            "text",
-            ""
+        print(
+            "Groq client initialized."
         )
-
-        if not transcript_text:
-            transcript_text = ""
-
-        request_id = str(uuid.uuid4())
-
-        return {
-            "success": True,
-            "request_id": request_id,
-            "transcript": {
-                "text": transcript_text,
-                "language": getattr(
-                    transcription,
-                    "language",
-                    None
-                ),
-                "duration": getattr(
-                    transcription,
-                    "duration",
-                    None
-                )
-            }
-        }
 
     except Exception as e:
 
-        print("TRANSCRIPTION ERROR:", repr(e))
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Transcription failed: {str(e)}"
+        print(
+            "Groq initialization error:",
+            e
         )
 
-    finally:
 
-        # ----------------------------------------------------
-        # Delete temporary audio file
-        # ----------------------------------------------------
+# ============================================================
+# INTERVIEW MEMORY
+# ============================================================
 
-        if temp_path and os.path.exists(temp_path):
-
-            try:
-                os.remove(temp_path)
-
-            except Exception:
-                pass
+INTERVIEWS: Dict[
+    str,
+    Dict[str, Any]
+] = {}
 
 
 # ============================================================
-# QWEN PROMPT
+# STARTUP
 # ============================================================
 
-def create_extraction_prompt(transcript: str) -> str:
+print()
+print("=" * 70)
+print("                    VOICERECRUIT")
+print("=" * 70)
 
-    return f"""
-You are the structured information extraction engine for FormVoice AI.
+print(
+    "LLM       :",
+    GROQ_LLM_MODEL
+)
 
-Your task is to convert a user's spoken transcript into a JSON object
-for a form.
+print(
+    "STT       :",
+    WHISPER_MODEL
+)
 
-IMPORTANT:
-- Return ONLY valid JSON.
-- Do NOT use Markdown.
-- Do NOT use ```json.
-- Do NOT add explanations.
-- Do NOT invent information.
-- If a field is not mentioned, return an empty string.
-- Preserve the information given by the user.
-- Correct obvious speech-to-text artifacts when the intended value is clear.
-- For phone numbers, preserve all digits.
-- For PIN codes, preserve all digits.
-- For application IDs, preserve letters and numbers exactly as intended.
-- For email addresses, convert spoken forms such as "at" and "dot"
-  into a normal email address when the intended email is obvious.
-- For dates, use a consistent readable format such as DD/MM/YYYY
-  when the date is clear.
-- Do not guess missing values.
--give fields in english only
+print(
+    "TTS       :",
+    RIME_MODEL
+)
 
-The JSON must contain EXACTLY these fields:
+print(
+    "Speaker   :",
+    RIME_SPEAKER
+)
 
-{{
-    "name": "",
-    "dob": "",
-    "phone": "",
-    "email": "",
-    "application_id": "",
-    "pin": "",
-    "address": "",
-    "city": "",
-    "state": "",
-    "paragraph": ""
-}}
+print(
+    "Groq      :",
+    "READY" if GROQ_API_KEY else "MISSING"
+)
 
-FIELD DEFINITIONS:
+print(
+    "Rime      :",
+    "READY" if RIME_API_KEY else "MISSING"
+)
 
-name:
-The person's full name.
-
-dob:
-Date of birth.
-
-phone:
-Phone/mobile number.
-
-email:
-Email address.
-
-application_id:
-Application/reference/registration ID containing letters and/or numbers.
-
-pin:
-PIN code or postal PIN code.
-
-address:
-Street/building/house address.
-
-city:
-City name.
-
-state:
-State name.
-
-paragraph:
-Any additional long-form information that does not clearly belong
-to another field.
-
-IMPORTANT FOR NUMBERS AND IDENTIFIERS:
-
-If the user says:
-
-"my application number is A B X 2 0 4 7 8 9 1"
-
-return:
-
-"application_id": "ABX2047891"
-
-If the user says:
-
-"my phone number is nine eight seven six five four three two one zero"
-
-return:
-
-"phone": "9876543210"
-
-If the user says:
-
-"PIN is four one one zero zero seven"
-
-return:
-
-"pin": "411007"
-
-Do NOT omit or modify digits.
-
-USER TRANSCRIPT:
-
-{transcript}
-
-Now return ONLY the JSON object.
-"""
+print("=" * 70)
+print()
 
 
 # ============================================================
-# CLEAN MODEL RESPONSE
+# PYDANTIC MODELS
 # ============================================================
 
-def clean_model_json(raw_output: str) -> dict:
-    """
-    Converts Qwen's response into a Python dictionary.
+class StartInterviewRequest(BaseModel):
 
-    Handles cases where the model accidentally returns:
+    candidate: Dict[str, Any] = Field(
+        default_factory=dict
+    )
 
-    ```json
-    {...}
-    ```
+    job: Dict[str, Any] = Field(
+        default_factory=dict
+    )
 
-    or additional text around the JSON.
-    """
 
-    if not raw_output:
-        raise ValueError("Model returned an empty response.")
+class ProcessAnswerRequest(BaseModel):
 
-    text = raw_output.strip()
+    transcript: str
+
+    current_question: str
+
+    candidate: Dict[str, Any] = Field(
+        default_factory=dict
+    )
+
+    job: Dict[str, Any] = Field(
+        default_factory=dict
+    )
+
+    conversation: List[
+        Dict[str, Any]
+    ] = Field(
+        default_factory=list
+    )
+
+    interview_id: Optional[str] = None
+
+    audio_duration: Optional[float] = None
+
+    filler_words: Optional[int] = None
+
+    wpm: Optional[float] = None
+
+
+class TTSRequest(BaseModel):
+
+    text: str
+
+
+# ============================================================
+# FILE EXTRACTION
+# ============================================================
+
+def extract_text_from_file(
+    content: bytes,
+    filename: str
+) -> str:
+
+    extension = os.path.splitext(
+        filename.lower()
+    )[1]
 
     # --------------------------------------------------------
-    # Remove Markdown code fences
+    # PDF
     # --------------------------------------------------------
+
+    if extension == ".pdf":
+
+        temp_path = None
+
+        try:
+
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=".pdf"
+            ) as temp:
+
+                temp.write(content)
+
+                temp_path = temp.name
+
+            reader = PdfReader(
+                temp_path
+            )
+
+            pages = []
+
+            for page in reader.pages:
+
+                text = page.extract_text()
+
+                if text:
+
+                    pages.append(text)
+
+            return "\n".join(
+                pages
+            ).strip()
+
+        except Exception as e:
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Could not read PDF: {str(e)}"
+                )
+            )
+
+        finally:
+
+            if temp_path:
+
+                try:
+
+                    os.unlink(
+                        temp_path
+                    )
+
+                except Exception:
+                    pass
+
+    # --------------------------------------------------------
+    # TXT / MD
+    # --------------------------------------------------------
+
+    if extension in [
+        ".txt",
+        ".md"
+    ]:
+
+        return content.decode(
+            "utf-8",
+            errors="ignore"
+        ).strip()
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Unsupported file type. "
+            "Use PDF, TXT or MD."
+        )
+    )
+
+
+# ============================================================
+# TEXT HELPERS
+# ============================================================
+
+def clean_llm_output(
+    text: str
+) -> str:
+
+    if not text:
+
+        return ""
+
+    text = str(
+        text
+    ).strip()
 
     text = re.sub(
-        r"^```json\s*",
+        r"^```(?:json|text)?\s*",
         "",
         text,
         flags=re.IGNORECASE
-    )
-
-    text = re.sub(
-        r"^```\s*",
-        "",
-        text
     )
 
     text = re.sub(
@@ -414,167 +370,2322 @@ def clean_model_json(raw_output: str) -> dict:
         text
     )
 
-    text = text.strip()
+    return text.strip()
 
-    # --------------------------------------------------------
-    # Direct JSON parsing
-    # --------------------------------------------------------
 
+def extract_json(
+    text: str
+) -> Dict[str, Any]:
+
+    text = clean_llm_output(
+        text
+    )
+
+    # Direct JSON
     try:
 
-        data = json.loads(text)
+        result = json.loads(
+            text
+        )
 
-        if isinstance(data, dict):
-            return data
+        if isinstance(
+            result,
+            dict
+        ):
 
-    except json.JSONDecodeError:
+            return result
+
+    except Exception:
         pass
 
-    # --------------------------------------------------------
-    # Try extracting JSON object from surrounding text
-    # --------------------------------------------------------
-
+    # JSON embedded in text
     start = text.find("{")
+
     end = text.rfind("}")
 
-    if start != -1 and end != -1 and end > start:
+    if (
+        start != -1
+        and end != -1
+        and end > start
+    ):
 
-        possible_json = text[start:end + 1]
+        candidate = text[
+            start:end + 1
+        ]
 
         try:
 
-            data = json.loads(possible_json)
+            result = json.loads(
+                candidate
+            )
 
-            if isinstance(data, dict):
-                return data
+            if isinstance(
+                result,
+                dict
+            ):
 
-        except json.JSONDecodeError:
+                return result
+
+        except Exception:
             pass
 
     raise ValueError(
-        f"Could not parse model response as JSON: {raw_output}"
+        "Invalid JSON returned by Groq."
+    )
+
+
+def count_words(
+    text: str
+) -> int:
+
+    return len(
+        re.findall(
+            r"\b[\w'-]+\b",
+            text or ""
+        )
+    )
+
+
+def count_fillers(
+    text: str
+) -> int:
+
+    if not text:
+
+        return 0
+
+    pattern = re.compile(
+        r"\b("
+        r"um+|uh+|erm|hmm|"
+        r"like|you know|basically|"
+        r"actually|literally|"
+        r"sort of|kind of"
+        r")\b",
+        re.IGNORECASE
+    )
+
+    return len(
+        pattern.findall(
+            text
+        )
+    )
+
+
+def calculate_wpm(
+    text: str,
+    duration_seconds: Optional[float]
+) -> Optional[float]:
+
+    if (
+        duration_seconds is None
+        or duration_seconds <= 0
+    ):
+
+        return None
+
+    words = count_words(
+        text
+    )
+
+    if words == 0:
+
+        return 0.0
+
+    return round(
+        words / (
+            duration_seconds / 60
+        ),
+        1
+    )
+
+
+def conversation_to_text(
+    conversation: List[
+        Dict[str, Any]
+    ]
+) -> str:
+
+    lines = []
+
+    for item in conversation:
+
+        role = item.get(
+            "role",
+            "unknown"
+        )
+
+        content = item.get(
+            "content",
+            ""
+        )
+
+        lines.append(
+            f"{role.upper()}: {content}"
+        )
+
+    return "\n".join(
+        lines
     )
 
 
 # ============================================================
-# NORMALIZE OUTPUT STRUCTURE
+# GROQ LLM
+# ============================================================
+#
+# This completely replaces Hugging Face.
+#
+# Groq official usage:
+#
+# client.chat.completions.create(...)
+#
 # ============================================================
 
-def ensure_form_fields(data: dict) -> dict:
-    """
-    Ensures the response contains exactly the fields expected
-    by the React frontend.
-    """
+def groq_generate(
+    prompt: str,
+    max_tokens: int = 1200,
+    temperature: float = 0.1
+) -> str:
 
-    result = {}
+    if groq_client is None:
 
-    for field in FORM_FIELDS:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "GROQ_API_KEY is missing."
+            )
+        )
 
-        value = data.get(field, "")
+    try:
 
-        if value is None:
-            value = ""
+        print()
+        print("-" * 70)
+        print("GROQ LLM REQUEST")
+        print("MODEL:", GROQ_LLM_MODEL)
+        print("-" * 70)
 
-        # Convert numbers to strings so React form fields
-        # receive consistent values.
-        if not isinstance(value, str):
-            value = str(value)
+        completion = (
+            groq_client
+            .chat
+            .completions
+            .create(
 
-        result[field] = value.strip()
+                model=GROQ_LLM_MODEL,
 
-    return result
+                messages=[
+                    {
+                        "role":
+                            "user",
+
+                        "content":
+                            prompt
+                    }
+                ],
+
+                temperature=
+                    temperature,
+
+                max_completion_tokens=
+                    max_tokens,
+
+                stream=False
+            )
+        )
+
+        if not completion.choices:
+
+            raise RuntimeError(
+                "Groq returned no choices."
+            )
+
+        content = (
+            completion
+            .choices[0]
+            .message
+            .content
+        )
+
+        if not content:
+
+            raise RuntimeError(
+                "Groq returned empty content."
+            )
+
+        print(
+            "Groq response received."
+        )
+
+        return str(
+            content
+        ).strip()
+
+    except HTTPException:
+
+        raise
+
+    except Exception as e:
+
+        print()
+        print("=" * 70)
+        print("GROQ LLM ERROR")
+        print("=" * 70)
+        print(str(e))
+        print("=" * 70)
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Groq LLM error: {str(e)}"
+            )
+        )
 
 
 # ============================================================
-# PROCESS VOICE
+# LANGCHAIN
 # ============================================================
 
-@app.post("/process-voice")
-async def process_voice(request: VoiceRequest):
-    """
-    Takes transcript text and uses Qwen to convert it into
-    structured form JSON.
-    """
+groq_runnable = RunnableLambda(
+    lambda prompt:
+        groq_generate(
+            prompt,
+            max_tokens=1200,
+            temperature=0.1
+        )
+)
 
-    transcript = request.transcript.strip()
+
+def run_langchain_prompt(
+    prompt_template: ChatPromptTemplate,
+    variables: Dict[str, Any]
+) -> str:
+
+    try:
+
+        messages = (
+            prompt_template
+            .format_messages(
+                **variables
+            )
+        )
+
+        prompt_text = "\n\n".join(
+
+            message.content
+
+            for message in messages
+        )
+
+        result = (
+            groq_runnable
+            .invoke(
+                prompt_text
+            )
+        )
+
+        return clean_llm_output(
+            result
+        )
+
+    except HTTPException:
+
+        raise
+
+    except Exception as e:
+
+        print(
+            "LangChain error:",
+            repr(e)
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"LangChain error: {str(e)}"
+            )
+        )
+
+
+# ============================================================
+# ANALYSIS PROMPT
+# ============================================================
+
+analysis_prompt = ChatPromptTemplate.from_messages(
+    [
+
+        (
+            "system",
+
+            """
+You are VoiceRecruit, an expert technical recruiter.
+
+Analyze the candidate resume against the job description.
+
+Extract:
+
+CANDIDATE:
+- name
+- email
+- phone
+- skills
+- projects
+- experience
+- education
+- summary
+
+JOB:
+- title
+- skills
+- responsibilities
+
+MATCH:
+- matching_skills
+- missing_skills
+
+INTERVIEW:
+- interview_focus
+
+Do not invent information.
+
+Only use information present in the
+resume and job description.
+
+Return ONLY valid JSON.
+
+The JSON must contain these top-level keys:
+
+candidate
+job
+matching_skills
+missing_skills
+interview_focus
+
+The candidate object should contain:
+
+name
+email
+phone
+skills
+projects
+experience
+education
+summary
+
+The job object should contain:
+
+title
+skills
+responsibilities
+
+matching_skills must be an array.
+
+missing_skills must be an array.
+
+interview_focus must be an array.
+
+Do not use markdown.
+Do not use code fences.
+Do not write anything outside the JSON.
+"""
+        ),
+
+        (
+            "human",
+
+            """
+RESUME:
+
+{resume}
+
+JOB DESCRIPTION:
+
+{job}
+"""
+        )
+    ]
+)
+
+
+# ============================================================
+# ANSWER EVALUATION PROMPT
+# ============================================================
+
+evaluation_prompt = ChatPromptTemplate.from_messages(
+    [
+
+        (
+            "system",
+
+            """
+You are an expert technical interviewer.
+
+Evaluate the candidate's answer.
+
+Score from 0 to 100:
+
+technical_score
+depth_score
+relevance_score
+problem_solving_score
+grammar_score
+communication_score
+vocabulary_score
+professional_tone_score
+confidence_score
+
+Also provide:
+
+strengths
+weaknesses
+feedback
+next_topic
+follow_up_needed
+
+Return ONLY valid JSON.
+
+Required keys:
+
+technical_score
+depth_score
+relevance_score
+problem_solving_score
+grammar_score
+communication_score
+vocabulary_score
+professional_tone_score
+confidence_score
+strengths
+weaknesses
+feedback
+next_topic
+follow_up_needed
+
+All scores must be integers from 0 to 100.
+
+strengths must be an array.
+
+weaknesses must be an array.
+
+follow_up_needed must be true or false.
+
+Evaluate only the candidate's actual answer.
+
+Do not invent experience.
+
+Do not use markdown.
+Do not use code fences.
+Do not write anything outside the JSON.
+"""
+        ),
+
+        (
+            "human",
+
+            """
+CANDIDATE:
+
+{candidate}
+
+JOB:
+
+{job}
+
+INTERVIEW QUESTION:
+
+{question}
+
+CANDIDATE ANSWER:
+
+{answer}
+
+PREVIOUS CONVERSATION:
+
+{conversation}
+"""
+        )
+    ]
+)
+
+
+# ============================================================
+# NEXT QUESTION PROMPT
+# ============================================================
+
+question_prompt = ChatPromptTemplate.from_messages(
+    [
+
+        (
+            "system",
+
+            """
+You are VoiceRecruit, an AI technical recruiter.
+
+Generate exactly ONE next interview question.
+
+Use:
+
+1. Candidate resume
+2. Job description
+3. Current question
+4. Candidate's latest answer
+5. Evaluation of the answer
+6. Previous conversation
+
+Rules:
+
+- Personalize the question.
+- Ask about actual candidate experience.
+- Test technical depth.
+- Probe weak reasoning.
+- Ask follow-up questions when appropriate.
+- Ask about important missing job requirements.
+- Gradually increase difficulty.
+- Never repeat an earlier question.
+- Ask only ONE question.
+- Make it natural for spoken conversation.
+- Do not number it.
+- Do not explain your reasoning.
+
+Return ONLY the question.
+"""
+        ),
+
+        (
+            "human",
+
+            """
+CANDIDATE:
+
+{candidate}
+
+JOB:
+
+{job}
+
+CURRENT QUESTION:
+
+{current_question}
+
+LATEST ANSWER:
+
+{answer}
+
+LATEST EVALUATION:
+
+{evaluation}
+
+PREVIOUS CONVERSATION:
+
+{conversation}
+"""
+        )
+    ]
+)
+
+
+# ============================================================
+# FINAL REPORT PROMPT
+# ============================================================
+
+final_report_prompt = ChatPromptTemplate.from_messages(
+    [
+
+        (
+            "system",
+
+            """
+You are a senior technical recruiter.
+
+Create a final interview assessment.
+
+Evaluate:
+
+technical knowledge
+problem solving
+communication
+grammar
+job fit
+confidence
+clarity
+vocabulary
+professional tone
+answer structure
+answer completion
+
+Also provide:
+
+verdict
+summary
+strengths
+improvements
+technical_summary
+communication_summary
+grammar_summary
+job_fit_summary
+recommendation
+
+Return ONLY valid JSON.
+
+Required keys:
+
+overall_score
+technical_knowledge
+problem_solving
+communication
+grammar
+job_fit
+confidence
+clarity
+vocabulary
+professional_tone
+answer_structure
+answer_completion
+verdict
+summary
+strengths
+improvements
+technical_summary
+communication_summary
+grammar_summary
+job_fit_summary
+recommendation
+
+All scores must be integers from 0 to 100.
+
+strengths must be an array.
+
+improvements must be an array.
+
+Do not invent information.
+
+Confidence must be based only on observable
+communication characteristics such as hesitation,
+fluency and clarity.
+
+Do not make psychological or medical claims.
+
+Do not use markdown.
+Do not use code fences.
+Do not write anything outside JSON.
+"""
+        ),
+
+        (
+            "human",
+
+            """
+CANDIDATE:
+
+{candidate}
+
+JOB:
+
+{job}
+
+INTERVIEW CONVERSATION:
+
+{conversation}
+
+ANSWER EVALUATIONS:
+
+{evaluations}
+
+VOICE METRICS:
+
+{voice_metrics}
+"""
+        )
+    ]
+)
+
+
+# ============================================================
+# GENERATE JSON
+# ============================================================
+
+def generate_json(
+    prompt_template: ChatPromptTemplate,
+    variables: Dict[str, Any]
+) -> Dict[str, Any]:
+
+    raw = run_langchain_prompt(
+        prompt_template,
+        variables
+    )
+
+    try:
+
+        return extract_json(
+            raw
+        )
+
+    except Exception as e:
+
+        print(
+            "Initial JSON parsing failed:",
+            e
+        )
+
+        # ----------------------------------------------------
+        # Groq retry
+        # ----------------------------------------------------
+
+        retry_prompt = f"""
+You are a JSON repair system.
+
+Convert the following response into
+valid JSON.
+
+Return ONLY valid JSON.
+
+Do not explain anything.
+
+MODEL RESPONSE:
+
+{raw}
+"""
+
+        retry = groq_generate(
+            retry_prompt,
+            max_tokens=1600,
+            temperature=0
+        )
+
+        try:
+
+            return extract_json(
+                retry
+            )
+
+        except Exception as second_error:
+
+            print(
+                "JSON retry failed:",
+                second_error
+            )
+
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Groq returned invalid JSON."
+                )
+            )
+
+
+# ============================================================
+# RIME TTS
+# ============================================================
+
+def text_to_speech(
+    text: str
+) -> str:
+
+    if not RIME_API_KEY:
+
+        print(
+            "RIME_API_KEY is missing."
+        )
+
+        return ""
+
+    text = (
+        text
+        .strip()
+    )
+
+    if not text:
+
+        return ""
+
+    print()
+    print("-" * 70)
+    print("RIME TTS")
+    print("TEXT:", text)
+    print("MODEL:", RIME_MODEL)
+    print("SPEAKER:", RIME_SPEAKER)
+    print("-" * 70)
+
+    headers = {
+
+        "Authorization":
+            f"Bearer {RIME_API_KEY}",
+
+        "Content-Type":
+            "application/json",
+
+        "Accept":
+            "audio/wav, audio/*, application/json"
+    }
+
+    payload = {
+
+        "text":
+            text,
+
+        "speaker":
+            RIME_SPEAKER,
+
+        "modelId":
+            RIME_MODEL
+    }
+
+    try:
+
+        response = requests.post(
+
+            RIME_URL,
+
+            headers=headers,
+
+            json=payload,
+
+            timeout=60
+        )
+
+        print(
+            "Rime status:",
+            response.status_code
+        )
+
+        if not response.ok:
+
+            print(
+                "Rime response:",
+                response.text
+            )
+
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Rime TTS failed: "
+                    f"{response.status_code} "
+                    f"{response.text}"
+                )
+            )
+
+        content_type = (
+            response
+            .headers
+            .get(
+                "content-type",
+                ""
+            )
+            .lower()
+        )
+
+        # ----------------------------------------------------
+        # RAW AUDIO
+        # ----------------------------------------------------
+
+        if (
+            "audio" in content_type
+            or "octet-stream" in content_type
+        ):
+
+            return base64.b64encode(
+                response.content
+            ).decode(
+                "utf-8"
+            )
+
+        # ----------------------------------------------------
+        # JSON RESPONSE
+        # ----------------------------------------------------
+
+        try:
+
+            data = response.json()
+
+        except Exception:
+
+            return base64.b64encode(
+                response.content
+            ).decode(
+                "utf-8"
+            )
+
+        for key in [
+
+            "audio",
+
+            "audioContent",
+
+            "audio_content",
+
+            "data"
+
+        ]:
+
+            value = data.get(
+                key
+            )
+
+            if value:
+
+                return str(
+                    value
+                )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Rime returned no audio."
+            )
+        )
+
+    except HTTPException:
+
+        raise
+
+    except Exception as e:
+
+        print(
+            "Rime exception:",
+            e
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Rime TTS error: {str(e)}"
+            )
+        )
+
+
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get("/")
+def root():
+
+    return {
+
+        "name":
+            "VoiceRecruit",
+
+        "status":
+            "running",
+
+        "llm":
+            GROQ_LLM_MODEL,
+
+        "stt":
+            WHISPER_MODEL,
+
+        "tts":
+            RIME_MODEL,
+
+        "speaker":
+            RIME_SPEAKER
+    }
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/health")
+def health():
+
+    return {
+
+        "status":
+            "ok",
+
+        "llm":
+            groq_client is not None,
+
+        "llm_provider":
+            "Groq",
+
+        "llm_model":
+            GROQ_LLM_MODEL,
+
+        "langchain":
+            True,
+
+        "stt":
+            groq_client is not None,
+
+        "stt_provider":
+            "Groq Whisper",
+
+        "stt_model":
+            WHISPER_MODEL,
+
+        "tts":
+            bool(RIME_API_KEY),
+
+        "tts_provider":
+            "Rime",
+
+        "tts_model":
+            RIME_MODEL,
+
+        "tts_speaker":
+            RIME_SPEAKER
+    }
+
+
+# ============================================================
+# ANALYZE RESUME + JOB
+# ============================================================
+
+@app.post("/analyze")
+async def analyze(
+
+    resume: UploadFile = File(...),
+
+    job_description: UploadFile = File(...)
+):
+
+    resume_bytes = await resume.read()
+
+    job_bytes = await job_description.read()
+
+    resume_text = extract_text_from_file(
+
+        resume_bytes,
+
+        resume.filename
+        or "resume.pdf"
+    )
+
+    job_text = extract_text_from_file(
+
+        job_bytes,
+
+        job_description.filename
+        or "job.pdf"
+    )
+
+    if not resume_text:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Resume is empty."
+        )
+
+    if not job_text:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Job description is empty."
+        )
+
+    print()
+    print("=" * 70)
+    print("ANALYZING RESUME + JOB")
+    print("=" * 70)
+
+    result = generate_json(
+
+        analysis_prompt,
+
+        {
+
+            "resume":
+                resume_text[:30000],
+
+            "job":
+                job_text[:20000]
+        }
+    )
+
+    return {
+
+        "success":
+            True,
+
+        "resume_text":
+            resume_text,
+
+        "job_description":
+            job_text,
+
+        "analysis":
+            result,
+
+        "candidate":
+            result.get(
+                "candidate",
+                {}
+            ),
+
+        "job":
+            result.get(
+                "job",
+                {}
+            ),
+
+        "matching_skills":
+            result.get(
+                "matching_skills",
+                []
+            ),
+
+        "missing_skills":
+            result.get(
+                "missing_skills",
+                []
+            ),
+
+        "interview_focus":
+            result.get(
+                "interview_focus",
+                []
+            )
+    }
+
+
+# ============================================================
+# START INTERVIEW
+# ============================================================
+
+@app.post("/start-interview")
+async def start_interview(
+
+    request: StartInterviewRequest
+):
+
+    interview_id = str(
+        uuid.uuid4()
+    )
+
+    candidate = request.candidate
+
+    job = request.job
+
+    # --------------------------------------------------------
+    # Generate first question using GROQ
+    # --------------------------------------------------------
+
+    prompt = f"""
+You are a professional technical recruiter.
+
+Start a personalized technical interview.
+
+CANDIDATE:
+
+{json.dumps(
+    candidate,
+    indent=2,
+    ensure_ascii=False
+)}
+
+JOB DESCRIPTION:
+
+{json.dumps(
+    job,
+    indent=2,
+    ensure_ascii=False
+)}
+
+Ask ONE strong opening question.
+
+The question should:
+
+- relate to the candidate's actual experience
+- relate to the job
+- be natural when spoken
+- encourage the candidate to explain something
+
+Return ONLY the question.
+
+Do not number it.
+Do not explain anything.
+"""
+
+    first_question = groq_generate(
+        prompt,
+        max_tokens=300,
+        temperature=0.3
+    )
+
+    first_question = clean_llm_output(
+        first_question
+    )
+
+    # --------------------------------------------------------
+    # RIME
+    # --------------------------------------------------------
+
+    audio = text_to_speech(
+        first_question
+    )
+
+    # --------------------------------------------------------
+    # STORE
+    # --------------------------------------------------------
+
+    INTERVIEWS[
+        interview_id
+    ] = {
+
+        "candidate":
+            candidate,
+
+        "job":
+            job,
+
+        "conversation": [
+
+            {
+
+                "role":
+                    "recruiter",
+
+                "content":
+                    first_question
+            }
+        ],
+
+        "evaluations":
+            [],
+
+        "voice_metrics":
+            [],
+
+        "question_count":
+            1,
+
+        "report":
+            None
+    }
+
+    return {
+
+        "success":
+            True,
+
+        "interview_id":
+            interview_id,
+
+        "question":
+            first_question,
+
+        "next_question":
+            first_question,
+
+        "audio":
+            audio,
+
+        "question_number":
+            1,
+
+        "complete":
+            False
+    }
+
+
+# ============================================================
+# TRANSCRIBE AUDIO
+# ============================================================
+
+@app.post("/transcribe")
+async def transcribe(
+
+    file: UploadFile = File(...)
+):
+
+    if groq_client is None:
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "GROQ_API_KEY is missing."
+            )
+        )
+
+    audio_bytes = await file.read()
+
+    if not audio_bytes:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Audio is empty."
+        )
+
+    filename = (
+        file.filename
+        or "answer.webm"
+    )
+
+    try:
+
+        transcription = (
+
+            groq_client
+            .audio
+            .transcriptions
+            .create(
+
+                file=(
+                    filename,
+                    audio_bytes
+                ),
+
+                model=
+                    WHISPER_MODEL,
+
+                response_format=
+                    "verbose_json",
+
+                temperature=
+                    0.0,
+
+                language=
+                    "en"
+            )
+        )
+
+        transcript = (
+            getattr(
+                transcription,
+                "text",
+                ""
+            )
+            or ""
+        ).strip()
+
+        duration = getattr(
+            transcription,
+            "duration",
+            None
+        )
+
+        filler_words = count_fillers(
+            transcript
+        )
+
+        word_count = count_words(
+            transcript
+        )
+
+        wpm = calculate_wpm(
+            transcript,
+            duration
+        )
+
+        return {
+
+            "success":
+                True,
+
+            "transcript":
+                transcript,
+
+            "text":
+                transcript,
+
+            "duration":
+                duration,
+
+            "word_count":
+                word_count,
+
+            "filler_words":
+                filler_words,
+
+            "wpm":
+                wpm
+        }
+
+    except Exception as e:
+
+        print(
+            "Whisper error:",
+            e
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Whisper transcription failed: {str(e)}"
+            )
+        )
+
+
+# ============================================================
+# EVALUATE ANSWER
+# ============================================================
+
+def evaluate_answer(
+
+    candidate: Dict[str, Any],
+
+    job: Dict[str, Any],
+
+    question: str,
+
+    answer: str,
+
+    conversation:
+        List[Dict[str, Any]]
+) -> Dict[str, Any]:
+
+    return generate_json(
+
+        evaluation_prompt,
+
+        {
+
+            "candidate":
+                json.dumps(
+                    candidate,
+                    indent=2,
+                    ensure_ascii=False
+                ),
+
+            "job":
+                json.dumps(
+                    job,
+                    indent=2,
+                    ensure_ascii=False
+                ),
+
+            "question":
+                question,
+
+            "answer":
+                answer,
+
+            "conversation":
+                conversation_to_text(
+                    conversation
+                )
+        }
+    )
+
+
+# ============================================================
+# GENERATE NEXT QUESTION
+# ============================================================
+
+def generate_next_question(
+
+    candidate: Dict[str, Any],
+
+    job: Dict[str, Any],
+
+    current_question: str,
+
+    answer: str,
+
+    evaluation: Dict[str, Any],
+
+    conversation:
+        List[Dict[str, Any]]
+) -> str:
+
+    question = run_langchain_prompt(
+
+        question_prompt,
+
+        {
+
+            "candidate":
+                json.dumps(
+                    candidate,
+                    indent=2,
+                    ensure_ascii=False
+                ),
+
+            "job":
+                json.dumps(
+                    job,
+                    indent=2,
+                    ensure_ascii=False
+                ),
+
+            "current_question":
+                current_question,
+
+            "answer":
+                answer,
+
+            "evaluation":
+                json.dumps(
+                    evaluation,
+                    indent=2,
+                    ensure_ascii=False
+                ),
+
+            "conversation":
+                conversation_to_text(
+                    conversation
+                )
+        }
+    )
+
+    question = clean_llm_output(
+        question
+    )
+
+    question = re.sub(
+
+        r"^(question\s*\d*\s*[:.\-]\s*)",
+
+        "",
+
+        question,
+
+        flags=re.IGNORECASE
+    )
+
+    return question.strip()
+
+
+# ============================================================
+# FINAL REPORT
+# ============================================================
+
+def generate_final_report(
+
+    candidate: Dict[str, Any],
+
+    job: Dict[str, Any],
+
+    conversation:
+        List[Dict[str, Any]],
+
+    evaluations:
+        List[Dict[str, Any]],
+
+    voice_metrics:
+        List[Dict[str, Any]]
+) -> Dict[str, Any]:
+
+    report = generate_json(
+
+        final_report_prompt,
+
+        {
+
+            "candidate":
+                json.dumps(
+                    candidate,
+                    indent=2,
+                    ensure_ascii=False
+                ),
+
+            "job":
+                json.dumps(
+                    job,
+                    indent=2,
+                    ensure_ascii=False
+                ),
+
+            "conversation":
+                conversation_to_text(
+                    conversation
+                ),
+
+            "evaluations":
+                json.dumps(
+                    evaluations,
+                    indent=2,
+                    ensure_ascii=False
+                ),
+
+            "voice_metrics":
+                json.dumps(
+                    voice_metrics,
+                    indent=2,
+                    ensure_ascii=False
+                )
+        }
+    )
+
+    score_fields = [
+
+        "overall_score",
+
+        "technical_knowledge",
+
+        "problem_solving",
+
+        "communication",
+
+        "grammar",
+
+        "job_fit",
+
+        "confidence",
+
+        "clarity",
+
+        "vocabulary",
+
+        "professional_tone",
+
+        "answer_structure",
+
+        "answer_completion"
+    ]
+
+    for field in score_fields:
+
+        if field in report:
+
+            try:
+
+                report[field] = max(
+                    0,
+                    min(
+                        100,
+                        int(
+                            float(
+                                report[field]
+                            )
+                        )
+                    )
+                )
+
+            except Exception:
+
+                report[field] = 0
+
+    # --------------------------------------------------------
+    # Voice statistics
+    # --------------------------------------------------------
+
+    wpms = [
+
+        x.get("wpm")
+
+        for x in voice_metrics
+
+        if x.get("wpm") is not None
+    ]
+
+    average_wpm = None
+
+    if wpms:
+
+        average_wpm = round(
+
+            sum(wpms)
+            /
+            len(wpms),
+
+            1
+        )
+
+    total_fillers = sum(
+
+        int(
+            x.get(
+                "filler_words",
+                0
+            ) or 0
+        )
+
+        for x in voice_metrics
+    )
+
+    report["voice_metrics"] = {
+
+        "average_wpm":
+            average_wpm,
+
+        "total_filler_words":
+            total_fillers,
+
+        "answers_analyzed":
+            len(
+                voice_metrics
+            )
+    }
+
+    return report
+
+
+# ============================================================
+# PROCESS ANSWER
+# ============================================================
+#
+# END ANSWER
+#      |
+#      v
+# Groq Whisper
+#      |
+#      v
+# Evaluate answer
+#      |
+#      v
+# Generate next question
+#      |
+#      v
+# Rime speaks next question
+#      |
+#      v
+# Return next_question + audio
+#
+# ============================================================
+
+@app.post("/process-answer")
+async def process_answer(
+
+    request: ProcessAnswerRequest
+):
+
+    transcript = (
+        request.transcript
+        or ""
+    ).strip()
 
     if not transcript:
 
         raise HTTPException(
             status_code=400,
-            detail="Transcript cannot be empty."
+            detail="Transcript is empty."
         )
 
-    if model is None:
+    # --------------------------------------------------------
+    # LOAD INTERVIEW
+    # --------------------------------------------------------
 
-        raise HTTPException(
-            status_code=500,
-            detail="HF_TOKEN is not configured."
+    interview = None
+
+    if request.interview_id:
+
+        interview = INTERVIEWS.get(
+            request.interview_id
         )
 
-    try:
+    if interview:
 
-        # ----------------------------------------------------
-        # Create prompt
-        # ----------------------------------------------------
+        candidate = interview[
+            "candidate"
+        ]
 
-        prompt = create_extraction_prompt(
+        job = interview[
+            "job"
+        ]
+
+        conversation = interview[
+            "conversation"
+        ]
+
+        evaluations = interview[
+            "evaluations"
+        ]
+
+        voice_metrics = interview[
+            "voice_metrics"
+        ]
+
+    else:
+
+        candidate = request.candidate
+
+        job = request.job
+
+        conversation = list(
+            request.conversation
+            or []
+        )
+
+        evaluations = []
+
+        voice_metrics = []
+
+    # --------------------------------------------------------
+    # EVALUATE ANSWER
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 70)
+    print("EVALUATING CANDIDATE ANSWER")
+    print("=" * 70)
+
+    evaluation = evaluate_answer(
+
+        candidate=
+            candidate,
+
+        job=
+            job,
+
+        question=
+            request.current_question,
+
+        answer=
+            transcript,
+
+        conversation=
+            conversation
+    )
+
+    # --------------------------------------------------------
+    # STORE ANSWER
+    # --------------------------------------------------------
+
+    conversation.append(
+
+        {
+
+            "role":
+                "candidate",
+
+            "content":
+                transcript
+        }
+    )
+
+    # --------------------------------------------------------
+    # VOICE METRICS
+    # --------------------------------------------------------
+
+    filler_words = (
+
+        request.filler_words
+
+        if request.filler_words
+        is not None
+
+        else count_fillers(
             transcript
         )
+    )
 
-        # ----------------------------------------------------
-        # Send transcript to Qwen
-        # ----------------------------------------------------
+    wpm = request.wpm
 
-        response = model.invoke(prompt)
+    if wpm is None:
 
-        # ----------------------------------------------------
-        # Extract model text
-        # ----------------------------------------------------
+        wpm = calculate_wpm(
 
-        if hasattr(response, "content"):
+            transcript,
 
-            raw_output = response.content
-
-        else:
-
-            raw_output = str(response)
-
-        print("\n================ QWEN OUTPUT ================\n")
-        print(raw_output)
-        print("\n=============================================\n")
-
-        # ----------------------------------------------------
-        # Convert model output → JSON
-        # ----------------------------------------------------
-
-        extracted_data = clean_model_json(
-            raw_output
+            request.audio_duration
         )
 
-        # ----------------------------------------------------
-        # Ensure correct form fields
-        # ----------------------------------------------------
+    voice_metric = {
 
-        form_data = ensure_form_fields(
-            extracted_data
+        "duration":
+            request.audio_duration,
+
+        "word_count":
+            count_words(
+                transcript
+            ),
+
+        "filler_words":
+            filler_words,
+
+        "wpm":
+            wpm
+    }
+
+    voice_metrics.append(
+        voice_metric
+    )
+
+    evaluations.append(
+        evaluation
+    )
+
+    # --------------------------------------------------------
+    # QUESTION COUNT
+    # --------------------------------------------------------
+
+    recruiter_questions = sum(
+
+        1
+
+        for item in conversation
+
+        if item.get(
+            "role"
+        ) == "recruiter"
+    )
+
+    should_finish = (
+
+        recruiter_questions
+        >= MAX_QUESTIONS
+    )
+
+    # --------------------------------------------------------
+    # FINISH AFTER QUESTION 7 IF
+    # NO FOLLOW-UP IS NEEDED
+    # --------------------------------------------------------
+
+    if (
+
+        recruiter_questions >= 7
+
+        and not evaluation.get(
+            "follow_up_needed",
+            False
+        )
+    ):
+
+        should_finish = True
+
+    # ========================================================
+    # FINAL REPORT
+    # ========================================================
+
+    if should_finish:
+
+        print()
+        print("=" * 70)
+        print("GENERATING FINAL REPORT")
+        print("=" * 70)
+
+        report = generate_final_report(
+
+            candidate=
+                candidate,
+
+            job=
+                job,
+
+            conversation=
+                conversation,
+
+            evaluations=
+                evaluations,
+
+            voice_metrics=
+                voice_metrics
         )
 
-        # ----------------------------------------------------
-        # Response
-        # ----------------------------------------------------
+        if interview:
+
+            interview[
+                "conversation"
+            ] = conversation
+
+            interview[
+                "evaluations"
+            ] = evaluations
+
+            interview[
+                "voice_metrics"
+            ] = voice_metrics
+
+            interview[
+                "report"
+            ] = report
 
         return {
-            "success": True,
-            "data": form_data,
-            "message": "Form information extracted successfully."
+
+            "success":
+                True,
+
+            "complete":
+                True,
+
+            "completed":
+                True,
+
+            "evaluation":
+                evaluation,
+
+            "report":
+                report,
+
+            "conversation":
+                conversation,
+
+            "next_question":
+                "",
+
+            "question":
+                "",
+
+            "audio":
+                ""
         }
 
-    except Exception as e:
+    # ========================================================
+    # GENERATE NEXT QUESTION
+    # ========================================================
 
-        print("QWEN PROCESSING ERROR:", repr(e))
+    print()
+    print("=" * 70)
+    print("GENERATING NEXT QUESTION")
+    print("=" * 70)
+
+    next_question = generate_next_question(
+
+        candidate=
+            candidate,
+
+        job=
+            job,
+
+        current_question=
+            request.current_question,
+
+        answer=
+            transcript,
+
+        evaluation=
+            evaluation,
+
+        conversation=
+            conversation
+    )
+
+    if not next_question:
 
         raise HTTPException(
             status_code=500,
-            detail=f"Structured extraction failed: {str(e)}"
+            detail=(
+                "Groq failed to generate next question."
+            )
         )
+
+    # --------------------------------------------------------
+    # SAVE NEXT QUESTION
+    # --------------------------------------------------------
+
+    conversation.append(
+
+        {
+
+            "role":
+                "recruiter",
+
+            "content":
+                next_question
+        }
+    )
+
+    # --------------------------------------------------------
+    # UPDATE INTERVIEW
+    # --------------------------------------------------------
+
+    if interview:
+
+        interview[
+            "conversation"
+        ] = conversation
+
+        interview[
+            "evaluations"
+        ] = evaluations
+
+        interview[
+            "voice_metrics"
+        ] = voice_metrics
+
+        interview[
+            "question_count"
+        ] = recruiter_questions + 1
+
+    # ========================================================
+    # RIME
+    # ========================================================
+
+    print()
+    print("=" * 70)
+    print("GENERATING RIME AUDIO")
+    print("=" * 70)
+
+    audio = text_to_speech(
+        next_question
+    )
+
+    # ========================================================
+    # FINAL RESPONSE
+    # ========================================================
+
+    return {
+
+        "success":
+            True,
+
+        "complete":
+            False,
+
+        "completed":
+            False,
+
+        # Evaluation of previous answer
+        "evaluation":
+            evaluation,
+
+        # NEW QUESTION
+        "next_question":
+            next_question,
+
+        # Compatibility
+        "question":
+            next_question,
+
+        # RIME AUDIO
+        "audio":
+            audio,
+
+        "question_number":
+            recruiter_questions + 1,
+
+        "conversation":
+            conversation,
+
+        "voice_metric":
+            voice_metric
+    }
+
+
+# ============================================================
+# DIRECT RIME TTS TEST
+# ============================================================
+
+@app.post("/tts")
+async def tts(
+    request: TTSRequest
+):
+
+    text = (
+        request.text
+        or ""
+    ).strip()
+
+    if not text:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Text cannot be empty."
+        )
+
+    audio = text_to_speech(
+        text
+    )
+
+    return {
+
+        "success":
+            True,
+
+        "text":
+            text,
+
+        "audio":
+            audio
+    }
+
+
+# ============================================================
+# GET INTERVIEW
+# ============================================================
+
+@app.get(
+    "/interview/{interview_id}"
+)
+async def get_interview(
+
+    interview_id: str
+):
+
+    interview = INTERVIEWS.get(
+        interview_id
+    )
+
+    if not interview:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Interview not found."
+        )
+
+    return {
+
+        "success":
+            True,
+
+        "interview":
+            interview
+    }
+
+
+# ============================================================
+# FINAL REPORT ENDPOINT
+# ============================================================
+
+@app.post(
+    "/interview/{interview_id}/report"
+)
+async def interview_report(
+
+    interview_id: str
+):
+
+    interview = INTERVIEWS.get(
+        interview_id
+    )
+
+    if not interview:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Interview not found."
+        )
+
+    if interview.get(
+        "report"
+    ):
+
+        return {
+
+            "success":
+                True,
+
+            "report":
+                interview["report"]
+        }
+
+    report = generate_final_report(
+
+        candidate=
+            interview["candidate"],
+
+        job=
+            interview["job"],
+
+        conversation=
+            interview["conversation"],
+
+        evaluations=
+            interview["evaluations"],
+
+        voice_metrics=
+            interview["voice_metrics"]
+    )
+
+    interview[
+        "report"
+    ] = report
+
+    return {
+
+        "success":
+            True,
+
+        "report":
+            report
+    }
+
+
+# ============================================================
+# SERVER
+# ============================================================
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    uvicorn.run(
+
+        "main:app",
+
+        host="0.0.0.0",
+
+        port=8000,
+
+        reload=True
+    )
