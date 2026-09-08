@@ -1,32 +1,49 @@
-# =========================================================
-# IMPORTS
-# =========================================================
-
-
-from datetime import datetime
-
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import re
 import os
-from uuid import uuid4
+import json
+import re
+import uuid
+import tempfile
+from typing import Optional
 
-from transcription import TranscriptionServiceError, transcribe_audio
+from dotenv import load_dotenv
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
 
 
-# =========================================================
-# FASTAPI APPLICATION
-# =========================================================
+# ============================================================
+# ENVIRONMENT
+# ============================================================
 
-app = FastAPI(title="FormVoice API")
+load_dotenv()
+
+HF_TOKEN = os.getenv("HF_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+if not HF_TOKEN:
+    print("WARNING: HF_TOKEN is not set.")
+
+if not GROQ_API_KEY:
+    print("WARNING: GROQ_API_KEY is not set.")
 
 
-# =========================================================
-# CORS CONFIGURATION
-# =========================================================
+# ============================================================
+# FASTAPI APP
+# ============================================================
 
+app = FastAPI(
+    title="FormVoice AI API",
+    description="Voice-native form filling using Groq Whisper and Qwen",
+    version="1.0.0"
+)
+
+
+# ============================================================
+# CORS
+# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,231 +54,33 @@ app.add_middleware(
 )
 
 
-# =========================================================
-# REQUEST MODEL
-# =========================================================
-# Defines the data expected by /process-voice.
-#
-# text:
-#   Transcript received from STT.
-#
-# current_form:
-#   Current values already present in the form.
-#
-# target_field:
-#   Identifies which field the user selected.
-#   Example: "name", "phone", "email".
-#
-# This target_field is what allows an individual microphone
-# to fill only the field it belongs to.
+# ============================================================
+# HUGGING FACE + QWEN
+# ============================================================
 
-class VoiceRequest(BaseModel):
-    text: str
-    current_form: dict
-    target_field: str | None = None
+if HF_TOKEN:
 
-
-# =========================================================
-# STT ERROR HANDLING
-# =========================================================
-# Creates a consistent JSON error response when something
-# goes wrong during speech-to-text.
-#
-# Examples:
-#   audio missing
-#   unsupported audio
-#   empty audio
-#   Groq authentication failure
-#   transcription service failure
-
-def transcription_error(request_id: str, status_code: int, code: str, message: str):
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "request_id": request_id,
-            "error": {
-                "code": code,
-                "message": message,
-            },
-        },
+    llm = HuggingFaceEndpoint(
+        repo_id="Qwen/Qwen2.5-72B-Instruct",
+        huggingfacehub_api_token=HF_TOKEN,
+        temperature=0.1,
+        max_new_tokens=4096
     )
 
-
-# =========================================================
-# SPEECH-TO-TEXT ENDPOINT
-# =========================================================
-# Receives the audio recorded by the browser.
-#
-# Working:
-#
-# Browser microphone
-#       ↓
-# Audio file
-#       ↓
-# /transcribe
-#       ↓
-# transcription.py
-#       ↓
-# Groq Whisper
-#       ↓
-# Transcript
-#       ↓
-# JSON response to frontend
-#
-# This endpoint is responsible ONLY for converting speech
-# into text. It does not decide which form field to fill.
-
-@app.post("/transcribe")
-async def transcribe(
-    audio: UploadFile | None = File(default=None),
-    language: str = Form(default="en"),
-):
-    request_id = str(uuid4())
-
-    # Check whether an audio file was provided.
-    if audio is None:
-        return transcription_error(
-            request_id, 400, "AUDIO_REQUIRED", "Include an audio file in the 'audio' field."
-        )
-
-    # Check that the uploaded file is actually an audio file.
-    content_type = audio.content_type or "application/octet-stream"
-
-    if not content_type.startswith("audio/"):
-        return transcription_error(
-            request_id, 415, "AUDIO_UNSUPPORTED", "Upload a supported audio file."
-        )
-
-    # Read the recorded audio.
-    audio_bytes = await audio.read()
-
-    # Reject empty recordings.
-    if not audio_bytes:
-        return transcription_error(
-            request_id, 400, "AUDIO_EMPTY", "The audio file is empty."
-        )
-
-    try:
-        # Send the audio to transcription.py.
-        # transcription.py handles the actual Groq Whisper call.
-        text = await transcribe_audio(
-            audio_bytes=audio_bytes,
-            filename=audio.filename or "recording.webm",
-            content_type=content_type,
-            language=language,
-        )
-
-    except TranscriptionServiceError as error:
-        # Convert STT service errors into our standard response.
-        return transcription_error(
-            request_id, error.status_code, error.code, error.message
-        )
-
-    # Send the transcript back to the frontend.
-    return {
-        "request_id": request_id,
-        "transcript": {
-            "text": text,
-            "language": language,
-            "confidence": None,
-        },
-    }
-
-
-# =========================================================
-# SPOKEN DIGIT CONVERSION
-# =========================================================
-# Converts individually spoken numbers into digits.
-#
-# Example:
-#
-# "nine eight seven six"
-#          ↓
-#       "9876"
-#
-# This is especially useful for phone numbers and PINs.
-
-def spoken_digits(text):
-    digit_words = {
-        "zero": "0",
-        "oh": "0",
-        "one": "1",
-        "two": "2",
-        "three": "3",
-        "four": "4",
-        "five": "5",
-        "six": "6",
-        "seven": "7",
-        "eight": "8",
-        "nine": "9",
-    }
-
-    tokens = re.findall(r"\d+|[a-z]+", text.lower())
-
-    return "".join(
-        token if token.isdigit() else digit_words.get(token, "")
-        for token in tokens
+    model = ChatHuggingFace(
+        llm=llm
     )
 
-
-# =========================================================
-# PHONE NUMBER EXTRACTION
-# =========================================================
-# Uses spoken_digits() to convert spoken numbers into digits.
-#
-# If 10 or more digits are found, the last 10 digits are
-# treated as the phone number.
-#
-# Example:
-# "nine eight seven six five four three two one zero"
-#                         ↓
-#                  "9876543210"
-
-def extract_phone(text):
-    digits = spoken_digits(text)
-
-    if len(digits) >= 10:
-        return digits[-10:]
-
-    return None
+else:
+    llm = None
+    model = None
 
 
-# =========================================================
-# APPLICATION ID EXTRACTION
-# =========================================================
-# Searches the transcript for an application-ID pattern.
-#
-# Expected general pattern:
-#   2–5 letters + 4–12 digits
-#
-# Example:
-#   AB123456
-#   APP-123456
-#
-# Spaces and hyphens are removed and the result is converted
-# to uppercase.
+# ============================================================
+# FORM STRUCTURE
+# ============================================================
 
-def extract_application_id(text):
-    match = re.search(
-        r"\b[A-Za-z]{2,5}[- ]?\d{4,12}\b",
-        text
-    )
-
-    if match:
-        return match.group().replace(" ", "").replace("-", "").upper()
-
-    return None
-
-
-# =========================================================
-# SUPPORTED FORM FIELDS
-# =========================================================
-# These are the fields that FormVoice currently supports.
-#
-# The target_field received from the frontend must be one
-# of these values.
-
-FORM_FIELDS = {
+FORM_FIELDS = [
     "name",
     "dob",
     "phone",
@@ -271,448 +90,491 @@ FORM_FIELDS = {
     "address",
     "city",
     "state",
-    "paragraph",
-}
+    "paragraph"
+]
 
 
-# =========================================================
-# GENERAL TEXT CLEANING
-# =========================================================
-# Removes unnecessary spaces and punctuation from captured
-# text before putting it into a form field.
+# ============================================================
+# REQUEST MODELS
+# ============================================================
 
-def clean_text(value):
-    return re.sub(r"\s+", " ", value).strip(" ,.:;-")
+class VoiceRequest(BaseModel):
+    transcript: str
 
 
-# =========================================================
-# REMOVE SPOKEN FIELD PREFIX
-# =========================================================
-# Removes phrases that users naturally say when speaking.
-#
-# Examples:
-#   "my name is Rahul Sharma" → "Rahul Sharma"
-#   "my city is Pune"         → "Pune"
-#   "address is Pune..."      → "Pune..."
-#
-# This allows the user to speak naturally instead of having
-# to say only the raw value.
-
-def strip_field_prefix(value, prefixes):
-    prefix_pattern = "|".join(re.escape(prefix) for prefix in prefixes)
-
-    return re.sub(
-        rf"^\s*(?:my\s+)?(?:{prefix_pattern})(?:\s+is|\s*:)?\s*",
-        "",
-        value,
-        flags=re.IGNORECASE,
-    )
-
-
-# =========================================================
-# FIELD-SPECIFIC NORMALIZATION
-# =========================================================
-# Each form field has its own normalization function.
-#
-# The purpose is to convert the transcript into a value that
-# is appropriate for that particular field.
-#
-# Examples:
-#   Name  → proper capitalization
-#   DOB   → standard date format
-#   Email → convert "at" and "dot"
-#   PIN   → spoken numbers to digits
-#   City  → clean + capitalization
-
-
-def normalize_name(value):
-    return clean_text(strip_field_prefix(value, ["full name", "name"])).title()
-
-
-def normalize_dob(value):
-    value = clean_text(strip_field_prefix(value, ["date of birth", "dob"]))
-
-    value = re.sub(
-        r"(\d+)(st|nd|rd|th)\b",
-        r"\1",
-        value,
-        flags=re.IGNORECASE
-    )
-
-    normalized = re.sub(r"[.-]", "/", value)
-
-    for format_string in (
-        "%d/%m/%Y",
-        "%m/%d/%Y",
-        "%Y/%m/%d",
-        "%d %B %Y",
-        "%B %d %Y",
-        "%d %b %Y",
-        "%b %d %Y",
-    ):
-        try:
-            return datetime.strptime(
-                normalized,
-                format_string
-            ).strftime("%d/%m/%Y")
-
-        except ValueError:
-            pass
-
-    return value
-
-
-def normalize_email(value):
-    value = strip_field_prefix(
-        value,
-        ["email address", "email", "e-mail"]
-    )
-
-    # Converts spoken "at" → @
-    value = re.sub(
-        r"\s+(?:at)\s+",
-        "@",
-        value,
-        flags=re.IGNORECASE
-    )
-
-    # Converts spoken "dot" → .
-    value = re.sub(
-        r"\s+(?:dot)\s+",
-        ".",
-        value,
-        flags=re.IGNORECASE
-    )
-
-    return re.sub(r"\s+", "", value).lower()
-
-
-def normalize_application_id(value):
-    extracted = extract_application_id(value)
-
-    return extracted or clean_text(
-        strip_field_prefix(
-            value,
-            ["application id", "application number"]
-        )
-    ).replace(" ", "").replace("-", "").upper()
-
-
-def normalize_pin(value):
-    value = strip_field_prefix(
-        value,
-        ["pin code", "pin"]
-    )
-
-    digits = spoken_digits(value)
-
-    return digits or clean_text(value)
-
-
-def normalize_address(value):
-    return clean_text(
-        strip_field_prefix(value, ["address"])
-    ).title()
-
-
-def normalize_city(value):
-    return clean_text(
-        strip_field_prefix(value, ["city"])
-    ).title()
-
-
-def normalize_state(value):
-    return clean_text(
-        strip_field_prefix(value, ["state"])
-    ).title()
-
-
-def normalize_paragraph(value):
-    return clean_text(
-        strip_field_prefix(
-            value,
-            ["paragraph", "description"]
-        )
-    )
-
-
-# =========================================================
-# FIELD NORMALIZER SELECTOR
-# =========================================================
-# Connects each field name to the correct normalization
-# function.
-#
-# Example:
-#
-# target_field = "name"
-#       ↓
-# normalize_name()
-#
-# target_field = "phone"
-#       ↓
-# extract_phone()
-
-def normalize_field(field, text):
-    normalizers = {
-        "name": normalize_name,
-        "dob": normalize_dob,
-        "phone": extract_phone,
-        "email": normalize_email,
-        "application_id": normalize_application_id,
-        "pin": normalize_pin,
-        "address": normalize_address,
-        "city": normalize_city,
-        "state": normalize_state,
-        "paragraph": normalize_paragraph,
-    }
-
-    return normalizers[field](text)
-
-
-# =========================================================
-# FIELD EXTRACTION
-# =========================================================
-# This is the main part responsible for putting the spoken
-# value into the correct form field.
-#
-# There are two modes:
-#
-# 1. FIELD-SPECIFIC MODE
-#    Used when the user clicks an individual mic.
-#
-#    Example:
-#    Name mic → "Rahul Sharma"
-#             → target_field = "name"
-#             → normalize_name()
-#             → name = "Rahul Sharma"
-#
-# 2. WHOLE-FORM MODE
-#    Used when the main Speak button is used.
-#    The backend tries to detect fields from the transcript.
-
-def extract_fields(text, current, target_field=None):
-
-    # Copy the current form so we can update it.
-    updated = current.copy()
-
-    # -----------------------------------------------------
-    # FIELD-SPECIFIC MODE
-    # -----------------------------------------------------
-    # If target_field exists, process ONLY that field.
-
-    if target_field:
-
-        # Make sure the requested field is supported.
-        if target_field not in FORM_FIELDS:
-            raise ValueError(
-                f"Unsupported target field: {target_field}"
-            )
-
-        # Select the appropriate normalizer.
-        value = normalize_field(
-            target_field,
-            text
-        )
-
-        # Put the result into the selected field.
-        if value:
-            updated[target_field] = value
-
-        return updated
-
-    # -----------------------------------------------------
-    # WHOLE-FORM MODE
-    # -----------------------------------------------------
-    # If no target field was provided, the system tries to
-    # detect different fields from the transcript.
-
-    lower = text.lower()
-
-    # Phone number detection.
-    phone = extract_phone(text)
-
-    if phone:
-        updated["phone"] = phone
-
-    # Application ID detection.
-    application_id = extract_application_id(text)
-
-    if application_id:
-        updated["application_id"] = application_id
-
-    # These fields are detected using spoken labels.
-    labelled_fields = {
-        "name": ("name is", "my name"),
-        "dob": ("date of birth", "dob"),
-        "email": ("email", "e-mail"),
-        "pin": ("pin",),
-        "address": ("address is", "my address"),
-        "city": ("city",),
-        "state": ("state",),
-        "paragraph": ("paragraph", "description"),
-    }
-
-    # Check whether any field-specific marker exists
-    # in the transcript.
-    for field, markers in labelled_fields.items():
-
-        if any(marker in lower for marker in markers):
-
-            # Normalize the detected field.
-            value = normalize_field(
-                field,
-                text
-            )
-
-            if value:
-                updated[field] = value
-
-    return updated
-
-
-# =========================================================
-# SPEECH-SAFE IDENTIFIER
-# =========================================================
-# Adds spaces between characters so identifiers are easier
-# to pronounce clearly if they are later sent to TTS.
-#
-# Example:
-#   APP123
-#       ↓
-#   A P P 1 2 3
-
-def speech_safe_id(value):
-
-    if not value:
-        return ""
-
-    return " ".join(value)
-
-
-# =========================================================
-# RESPONSE / CONFIRMATION MESSAGE
-# =========================================================
-# Creates a message that can be displayed to the user.
-#
-# Currently it gives special messages for:
-#   Application ID
-#   Phone
-#   Name
-#
-# This is separate from the actual field-filling logic.
-
-def generate_message(form):
-
-    if form.get("application_id"):
-
-        spoken_id = speech_safe_id(
-            form["application_id"]
-        )
-
-        return (
-            f"I heard application ID "
-            f"{spoken_id}. "
-            f"Is that correct?"
-        )
-
-    if form.get("phone"):
-
-        spoken_phone = speech_safe_id(
-            form["phone"]
-        )
-
-        return (
-            f"I heard phone number "
-            f"{spoken_phone}. "
-            f"Is that correct?"
-        )
-
-    if form.get("name"):
-
-        return (
-            f"I heard your name as "
-            f"{form['name']}. "
-            f"Is that correct?"
-        )
-
-    return "Please tell me your details."
-
-
-# =========================================================
-# PROCESS-VOICE ENDPOINT
-# =========================================================
-# This endpoint receives the transcript from the frontend
-# and converts it into form values.
-#
-# Field mic flow:
-#
-# /transcribe
-#      ↓
-# transcript
-#      ↓
-# /process-voice
-#      ↓
-# target_field
-#      ↓
-# normalize selected field
-#      ↓
-# updated form
-#
-# If target_field is missing, whole-form processing is used.
-
-@app.post("/process-voice")
-async def process_voice(request: VoiceRequest):
-
-    # Validate the requested field.
-    if (
-        request.target_field
-        and request.target_field not in FORM_FIELDS
-    ):
-        raise HTTPException(
-            status_code=422,
-            detail="Unsupported target field."
-        )
-
-    # Extract and normalize the transcript.
-    form = extract_fields(
-        request.text,
-        request.current_form,
-        request.target_field,
-    )
-
-    # Create the response message.
-    message = generate_message(form)
-
-
-    # =====================================================
-    # TEXT-TO-SPEECH PLACEHOLDER
-    # =====================================================
-    # TTS has not been connected yet.
-    # Currently audio_url is therefore None.
-    #
-    # Future:
-    # audio_url = await generate_rime_audio(message)
-
-    audio_url = None
-
-
-    # Return the updated form and response message.
-    return {
-        "form": form,
-        "message": message,
-        "audio_url": audio_url
-    }
-
-
-# =========================================================
-# ROOT / HEALTH CHECK
-# =========================================================
-# Simple endpoint used to confirm that the backend is
-# running correctly.
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.get("/")
 def root():
-
     return {
-        "status": "FormVoice backend running"
+        "success": True,
+        "message": "FormVoice AI backend is running",
+        "services": {
+            "transcription": "Groq Whisper",
+            "structured_extraction": "Qwen/Qwen2.5-72B-Instruct"
+        }
     }
+
+
+# ============================================================
+# TRANSCRIPTION
+# ============================================================
+
+@app.post("/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    """
+    Receives microphone audio and converts it into text.
+
+    Frontend:
+        audio file
+            ↓
+        /transcribe
+            ↓
+        transcript
+    """
+
+    if not GROQ_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="GROQ_API_KEY is not configured."
+        )
+
+    if not file:
+        raise HTTPException(
+            status_code=400,
+            detail="No audio file received."
+        )
+
+    # --------------------------------------------------------
+    # Save uploaded audio temporarily
+    # --------------------------------------------------------
+
+    extension = ".webm"
+
+    if file.filename:
+        original_extension = os.path.splitext(file.filename)[1]
+
+        if original_extension:
+            extension = original_extension
+
+    temp_path = None
+
+    try:
+
+        audio_bytes = await file.read()
+
+        if not audio_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded audio file is empty."
+            )
+
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=extension
+        ) as temp_file:
+
+            temp_file.write(audio_bytes)
+            temp_path = temp_file.name
+
+        # ----------------------------------------------------
+        # Groq Whisper
+        # ----------------------------------------------------
+
+        from groq import Groq
+
+        client = Groq(
+            api_key=GROQ_API_KEY
+        )
+
+        with open(temp_path, "rb") as audio_file:
+
+            transcription = client.audio.transcriptions.create(
+                file=audio_file,
+                model="whisper-large-v3-turbo",
+                response_format="verbose_json"
+            )
+
+        # ----------------------------------------------------
+        # Extract transcript
+        # ----------------------------------------------------
+
+        transcript_text = getattr(
+            transcription,
+            "text",
+            ""
+        )
+
+        if not transcript_text:
+            transcript_text = ""
+
+        request_id = str(uuid.uuid4())
+
+        return {
+            "success": True,
+            "request_id": request_id,
+            "transcript": {
+                "text": transcript_text,
+                "language": getattr(
+                    transcription,
+                    "language",
+                    None
+                ),
+                "duration": getattr(
+                    transcription,
+                    "duration",
+                    None
+                )
+            }
+        }
+
+    except Exception as e:
+
+        print("TRANSCRIPTION ERROR:", repr(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Transcription failed: {str(e)}"
+        )
+
+    finally:
+
+        # ----------------------------------------------------
+        # Delete temporary audio file
+        # ----------------------------------------------------
+
+        if temp_path and os.path.exists(temp_path):
+
+            try:
+                os.remove(temp_path)
+
+            except Exception:
+                pass
+
+
+# ============================================================
+# QWEN PROMPT
+# ============================================================
+
+def create_extraction_prompt(transcript: str) -> str:
+
+    return f"""
+You are the structured information extraction engine for FormVoice AI.
+
+Your task is to convert a user's spoken transcript into a JSON object
+for a form.
+
+IMPORTANT:
+- Return ONLY valid JSON.
+- Do NOT use Markdown.
+- Do NOT use ```json.
+- Do NOT add explanations.
+- Do NOT invent information.
+- If a field is not mentioned, return an empty string.
+- Preserve the information given by the user.
+- Correct obvious speech-to-text artifacts when the intended value is clear.
+- For phone numbers, preserve all digits.
+- For PIN codes, preserve all digits.
+- For application IDs, preserve letters and numbers exactly as intended.
+- For email addresses, convert spoken forms such as "at" and "dot"
+  into a normal email address when the intended email is obvious.
+- For dates, use a consistent readable format such as DD/MM/YYYY
+  when the date is clear.
+- Do not guess missing values.
+-give fields in english only
+
+The JSON must contain EXACTLY these fields:
+
+{{
+    "name": "",
+    "dob": "",
+    "phone": "",
+    "email": "",
+    "application_id": "",
+    "pin": "",
+    "address": "",
+    "city": "",
+    "state": "",
+    "paragraph": ""
+}}
+
+FIELD DEFINITIONS:
+
+name:
+The person's full name.
+
+dob:
+Date of birth.
+
+phone:
+Phone/mobile number.
+
+email:
+Email address.
+
+application_id:
+Application/reference/registration ID containing letters and/or numbers.
+
+pin:
+PIN code or postal PIN code.
+
+address:
+Street/building/house address.
+
+city:
+City name.
+
+state:
+State name.
+
+paragraph:
+Any additional long-form information that does not clearly belong
+to another field.
+
+IMPORTANT FOR NUMBERS AND IDENTIFIERS:
+
+If the user says:
+
+"my application number is A B X 2 0 4 7 8 9 1"
+
+return:
+
+"application_id": "ABX2047891"
+
+If the user says:
+
+"my phone number is nine eight seven six five four three two one zero"
+
+return:
+
+"phone": "9876543210"
+
+If the user says:
+
+"PIN is four one one zero zero seven"
+
+return:
+
+"pin": "411007"
+
+Do NOT omit or modify digits.
+
+USER TRANSCRIPT:
+
+{transcript}
+
+Now return ONLY the JSON object.
+"""
+
+
+# ============================================================
+# CLEAN MODEL RESPONSE
+# ============================================================
+
+def clean_model_json(raw_output: str) -> dict:
+    """
+    Converts Qwen's response into a Python dictionary.
+
+    Handles cases where the model accidentally returns:
+
+    ```json
+    {...}
+    ```
+
+    or additional text around the JSON.
+    """
+
+    if not raw_output:
+        raise ValueError("Model returned an empty response.")
+
+    text = raw_output.strip()
+
+    # --------------------------------------------------------
+    # Remove Markdown code fences
+    # --------------------------------------------------------
+
+    text = re.sub(
+        r"^```json\s*",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r"^```\s*",
+        "",
+        text
+    )
+
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text
+    )
+
+    text = text.strip()
+
+    # --------------------------------------------------------
+    # Direct JSON parsing
+    # --------------------------------------------------------
+
+    try:
+
+        data = json.loads(text)
+
+        if isinstance(data, dict):
+            return data
+
+    except json.JSONDecodeError:
+        pass
+
+    # --------------------------------------------------------
+    # Try extracting JSON object from surrounding text
+    # --------------------------------------------------------
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start != -1 and end != -1 and end > start:
+
+        possible_json = text[start:end + 1]
+
+        try:
+
+            data = json.loads(possible_json)
+
+            if isinstance(data, dict):
+                return data
+
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(
+        f"Could not parse model response as JSON: {raw_output}"
+    )
+
+
+# ============================================================
+# NORMALIZE OUTPUT STRUCTURE
+# ============================================================
+
+def ensure_form_fields(data: dict) -> dict:
+    """
+    Ensures the response contains exactly the fields expected
+    by the React frontend.
+    """
+
+    result = {}
+
+    for field in FORM_FIELDS:
+
+        value = data.get(field, "")
+
+        if value is None:
+            value = ""
+
+        # Convert numbers to strings so React form fields
+        # receive consistent values.
+        if not isinstance(value, str):
+            value = str(value)
+
+        result[field] = value.strip()
+
+    return result
+
+
+# ============================================================
+# PROCESS VOICE
+# ============================================================
+
+@app.post("/process-voice")
+async def process_voice(request: VoiceRequest):
+    """
+    Takes transcript text and uses Qwen to convert it into
+    structured form JSON.
+    """
+
+    transcript = request.transcript.strip()
+
+    if not transcript:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Transcript cannot be empty."
+        )
+
+    if model is None:
+
+        raise HTTPException(
+            status_code=500,
+            detail="HF_TOKEN is not configured."
+        )
+
+    try:
+
+        # ----------------------------------------------------
+        # Create prompt
+        # ----------------------------------------------------
+
+        prompt = create_extraction_prompt(
+            transcript
+        )
+
+        # ----------------------------------------------------
+        # Send transcript to Qwen
+        # ----------------------------------------------------
+
+        response = model.invoke(prompt)
+
+        # ----------------------------------------------------
+        # Extract model text
+        # ----------------------------------------------------
+
+        if hasattr(response, "content"):
+
+            raw_output = response.content
+
+        else:
+
+            raw_output = str(response)
+
+        print("\n================ QWEN OUTPUT ================\n")
+        print(raw_output)
+        print("\n=============================================\n")
+
+        # ----------------------------------------------------
+        # Convert model output → JSON
+        # ----------------------------------------------------
+
+        extracted_data = clean_model_json(
+            raw_output
+        )
+
+        # ----------------------------------------------------
+        # Ensure correct form fields
+        # ----------------------------------------------------
+
+        form_data = ensure_form_fields(
+            extracted_data
+        )
+
+        # ----------------------------------------------------
+        # Response
+        # ----------------------------------------------------
+
+        return {
+            "success": True,
+            "data": form_data,
+            "message": "Form information extracted successfully."
+        }
+
+    except Exception as e:
+
+        print("QWEN PROCESSING ERROR:", repr(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Structured extraction failed: {str(e)}"
+        )

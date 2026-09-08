@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useRef, useState } from "react";
 import "./App.css";
 
 const API_BASE_URL =
@@ -21,601 +21,858 @@ const fieldLabels = {
   name: "Full Name",
   dob: "Date of Birth",
   phone: "Phone Number",
-  email: "Email",
+  email: "Email Address",
   application_id: "Application ID",
   pin: "PIN Code",
   address: "Address",
   city: "City",
   state: "State",
-  paragraph: "Paragraph / Description",
+  paragraph: "Additional Information",
 };
 
 function App() {
   const [form, setForm] = useState(initialForm);
-  const [message, setMessage] = useState(
-    "Click the microphone and speak your details."
-  );
-  const [status, setStatus] = useState("Ready");
   const [transcript, setTranscript] = useState("");
-  const [activeField, setActiveField] = useState(null);
+  const [message, setMessage] = useState("Ready to listen.");
+  const [status, setStatus] = useState("idle");
+  const [isRecording, setIsRecording] = useState(false);
 
   const recorderRef = useRef(null);
   const streamRef = useRef(null);
   const audioChunksRef = useRef([]);
 
-  useEffect(() => {
-    return () => {
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-    };
-  }, []);
+  // =====================================================
+  // PROCESS TRANSCRIPT → QWEN → JSON
+  // =====================================================
 
-  const completedFields = useMemo(() => {
-    return Object.values(form).filter(
-      (value) => String(value).trim() !== ""
-    ).length;
-  }, [form]);
-
-  const progressPercent = (completedFields / 10) * 100;
-
-  const stopMicrophone = () => {
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
-  };
-
-  const handleChange = (event) => {
-    const { name, value } = event.target;
-
-    setForm((previous) => ({
-      ...previous,
-      [name]: value,
-    }));
-  };
-
-  const processVoice = async (transcriptText, targetField = null) => {
-    setStatus("Processing");
-
-    if (targetField) {
-      setMessage(`Understanding your ${fieldLabels[targetField]}...`);
-    } else {
-      setMessage("Understanding your details...");
-    }
-
+  const processVoice = async (transcriptText) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/process-voice`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          text: transcriptText,
-          current_form: form,
-          target_field: targetField,
-        }),
-      });
+      setStatus("processing");
+      setMessage("AI is understanding your information...");
 
-      const payload = await response.json();
-
-      if (!response.ok) {
-        throw new Error(
-          payload.detail ||
-            payload.error?.message ||
-            "Unable to process your voice input."
-        );
-      }
-
-      if (targetField) {
-        const returnedValue =
-          payload.form?.[targetField] ??
-          payload.value ??
-          transcriptText;
-
-        setForm((previous) => ({
-          ...previous,
-          [targetField]: returnedValue,
-        }));
-      } else if (payload.form) {
-        setForm((previous) => ({
-          ...previous,
-          ...payload.form,
-        }));
-      }
-
-      setMessage(
-        payload.message ||
-          (targetField
-            ? `${fieldLabels[targetField]} updated successfully.`
-            : "Your details have been added to the form.")
+      const response = await fetch(
+        `${API_BASE_URL}/process-voice`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            transcript: transcriptText,
+          }),
+        }
       );
 
-      setStatus("Success");
-    } catch (error) {
-      setStatus("Error");
-      setMessage(error.message || "Unable to process voice input.");
-    }
-  };
+      const result = await response.json();
 
-  const uploadRecording = async (audioBlob, targetField = null) => {
-    if (!audioBlob || audioBlob.size === 0) {
-      setStatus("Error");
-      setMessage("No audio was recorded. Please try again.");
-      return;
-    }
-
-    setStatus("Processing");
-    setMessage("Converting your speech to text...");
-
-    const formData = new FormData();
-
-    const extension = audioBlob.type.includes("ogg")
-      ? "ogg"
-      : audioBlob.type.includes("mp4")
-      ? "mp4"
-      : "webm";
-
-    formData.append(
-      "audio",
-      audioBlob,
-      `recording.${extension}`
-    );
-
-    formData.append("language", "en");
-
-    try {
-      const response = await fetch(`${API_BASE_URL}/transcribe`, {
-        method: "POST",
-        body: formData,
-      });
-
-      const payload = await response.json();
+      console.log("Qwen response:", result);
 
       if (!response.ok) {
         throw new Error(
-          payload.error?.message ||
-            payload.detail ||
-            "Unable to transcribe the audio."
+          result.detail ||
+            result.error ||
+            `Backend error: ${response.status}`
         );
       }
 
-      const transcriptText = payload.transcript?.text || "";
+      if (!result.success) {
+        throw new Error(
+          result.error ||
+            result.message ||
+            "AI processing failed."
+        );
+      }
+
+      setForm((previousForm) => ({
+        ...previousForm,
+        ...result.data,
+      }));
+
+      setMessage("✓ Form updated successfully.");
+      setStatus("success");
+
+    } catch (error) {
+      console.error("Processing error:", error);
+
+      setMessage(
+        error.message ||
+          "Could not process the transcript."
+      );
+
+      setStatus("error");
+    }
+  };
+
+  // =====================================================
+  // AUDIO → GROQ WHISPER → TRANSCRIPT
+  // =====================================================
+
+  const uploadRecording = async (audioBlob) => {
+    try {
+      setStatus("transcribing");
+      setMessage("Transcribing your voice...");
+
+      const formData = new FormData();
+
+      // IMPORTANT:
+      // Backend expects "file", NOT "audio"
+      formData.append(
+        "file",
+        audioBlob,
+        "recording.webm"
+      );
+
+      const response = await fetch(
+        `${API_BASE_URL}/transcribe`,
+        {
+          method: "POST",
+          body: formData,
+        }
+      );
+
+      const result = await response.json();
+
+      console.log("Transcription response:", result);
+
+      if (!response.ok) {
+        throw new Error(
+          result.detail ||
+            result.error ||
+            `Transcription error: ${response.status}`
+        );
+      }
+
+      if (!result.success) {
+        throw new Error(
+          result.error ||
+            "Transcription failed."
+        );
+      }
+
+      const transcriptText =
+        result.transcript?.text || "";
 
       if (!transcriptText.trim()) {
-        throw new Error("No speech was detected.");
+        throw new Error(
+          "No speech was detected. Please try again."
+        );
       }
 
       setTranscript(transcriptText);
 
-      await processVoice(transcriptText, targetField);
+      // Send transcript to Qwen
+      await processVoice(transcriptText);
+
     } catch (error) {
-      setStatus("Error");
+      console.error(
+        "Upload/transcription error:",
+        error
+      );
+
       setMessage(
         error.message ||
-          "Unable to contact the speech-to-text service."
+          "Could not process your recording."
       );
+
+      setStatus("error");
     }
   };
 
-  const startRecording = async (targetField = null) => {
-    if (
-      !navigator.mediaDevices?.getUserMedia ||
-      !window.MediaRecorder
-    ) {
-      setStatus("Error");
-      setMessage(
-        "This browser does not support microphone recording."
-      );
-      return;
-    }
+  // =====================================================
+  // START RECORDING
+  // =====================================================
 
+  const startRecording = async () => {
     try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error(
+          "Microphone access is not supported by this browser."
+        );
+      }
+
+      if (!window.MediaRecorder) {
+        throw new Error(
+          "MediaRecorder is not supported by this browser."
+        );
+      }
+
       const stream =
         await navigator.mediaDevices.getUserMedia({
           audio: true,
         });
 
-      const mimeType =
-        MediaRecorder.isTypeSupported("audio/webm")
-          ? "audio/webm"
-          : undefined;
-
-      const recorder = mimeType
-        ? new MediaRecorder(stream, { mimeType })
-        : new MediaRecorder(stream);
-
-      recorderRef.current = recorder;
       streamRef.current = stream;
       audioChunksRef.current = [];
-      setActiveField(targetField);
+
+      const recorder = new MediaRecorder(stream);
+
+      recorderRef.current = recorder;
 
       recorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
+          audioChunksRef.current.push(
+            event.data
+          );
         }
       };
 
-      recorder.onerror = () => {
-        stopMicrophone();
-        setActiveField(null);
-        setStatus("Error");
-        setMessage("Recording failed. Please try again.");
-      };
-
       recorder.onstop = async () => {
-        stopMicrophone();
-
         const audioBlob = new Blob(
           audioChunksRef.current,
           {
-            type:
-              recorder.mimeType || "audio/webm",
+            type: "audio/webm",
           }
         );
 
-        const savedField = targetField;
+        // Stop microphone
+        if (streamRef.current) {
+          streamRef.current
+            .getTracks()
+            .forEach((track) => track.stop());
+        }
 
-        setActiveField(null);
+        streamRef.current = null;
 
-        await uploadRecording(
-          audioBlob,
-          savedField
-        );
+        await uploadRecording(audioBlob);
       };
 
       recorder.start();
 
-      setTranscript("");
-      setStatus("Listening");
+      setIsRecording(true);
+      setStatus("recording");
+      setMessage("Listening... speak naturally.");
 
-      if (targetField) {
-        setMessage(
-          `Listening for ${fieldLabels[targetField]}... Click the microphone again when finished.`
-        );
-      } else {
-        setMessage(
-          "Listening... Speak your details and click Stop recording when finished."
-        );
-      }
-    } catch {
-      setStatus("Error");
-      setActiveField(null);
-      setMessage(
-        "Microphone permission was denied or unavailable."
+    } catch (error) {
+      console.error(
+        "Microphone error:",
+        error
       );
+
+      setMessage(
+        error.message ||
+          "Could not access your microphone."
+      );
+
+      setStatus("error");
     }
   };
 
-  const handleMainSpeak = () => {
+  // =====================================================
+  // STOP RECORDING
+  // =====================================================
+
+  const stopRecording = () => {
     if (
-      recorderRef.current?.state === "recording"
+      recorderRef.current &&
+      recorderRef.current.state !== "inactive"
     ) {
       recorderRef.current.stop();
-      return;
     }
 
-    startRecording(null);
+    setIsRecording(false);
+    setMessage("Processing your recording...");
   };
 
-  const handleFieldSpeak = (fieldName) => {
-    if (
-      recorderRef.current?.state === "recording"
-    ) {
-      recorderRef.current.stop();
-      return;
+  // =====================================================
+  // MAIN MICROPHONE
+  // =====================================================
+
+  const handleSpeak = () => {
+    if (isRecording) {
+      stopRecording();
+    } else {
+      startRecording();
     }
-
-    startRecording(fieldName);
   };
+
+  // =====================================================
+  // MANUAL FIELD EDIT
+  // =====================================================
+
+  const handleChange = (field, value) => {
+    setForm((previousForm) => ({
+      ...previousForm,
+      [field]: value,
+    }));
+  };
+
+  // =====================================================
+  // CLEAR
+  // =====================================================
 
   const clearForm = () => {
     setForm(initialForm);
     setTranscript("");
-    setStatus("Ready");
-    setActiveField(null);
-    setMessage(
-      "Form cleared. Click the microphone and speak your details."
-    );
+    setMessage("Ready to listen.");
+    setStatus("idle");
   };
+
+  // =====================================================
+  // SUBMIT
+  // =====================================================
 
   const handleSubmit = (event) => {
     event.preventDefault();
 
+    console.log(
+      "Final Form:",
+      form
+    );
+
     setMessage(
-      "Your form is ready to be submitted."
+      "✓ Form submitted successfully."
     );
 
-    setStatus("Ready");
+    setStatus("success");
   };
 
-  const renderInput = (
-    name,
-    placeholder,
-    type = "text"
-  ) => {
-    const isListening =
-      activeField === name &&
-      status === "Listening";
+  // =====================================================
+  // PROGRESS
+  // =====================================================
 
-    return (
-      <div className="field-group">
-        <label htmlFor={name}>
-          {fieldLabels[name]}
-        </label>
+  const filledFields = Object.values(form).filter(
+    (value) =>
+      value &&
+      value.toString().trim() !== ""
+  ).length;
 
-        <div
-          className={`voice-input-wrapper ${
-            isListening ? "field-listening" : ""
-          }`}
-        >
-          <input
-            id={name}
-            name={name}
-            type={type}
-            value={form[name]}
-            onChange={handleChange}
-            placeholder={placeholder}
-          />
+  const progress =
+    (filledFields / Object.keys(form).length) * 100;
 
-          <button
-            type="button"
-            className={`field-mic ${
-              isListening ? "active" : ""
-            }`}
-            onClick={() =>
-              handleFieldSpeak(name)
-            }
-            aria-label={`Speak for ${fieldLabels[name]}`}
-            title={`Speak for ${fieldLabels[name]}`}
-          >
-            {isListening ? "●" : "🎙"}
-          </button>
-        </div>
-      </div>
-    );
+  // =====================================================
+  // STATUS TEXT
+  // =====================================================
+
+  const getStatusText = () => {
+    switch (status) {
+      case "recording":
+        return "Listening...";
+      case "transcribing":
+        return "Transcribing...";
+      case "processing":
+        return "AI processing...";
+      case "success":
+        return "Ready";
+      case "error":
+        return "Something went wrong";
+      default:
+        return "Ready";
+    }
   };
 
-  const renderTextarea = (
-    name,
-    placeholder,
-    rows
-  ) => {
-    const isListening =
-      activeField === name &&
-      status === "Listening";
-
-    return (
-      <div className="field-group full-width">
-        <label htmlFor={name}>
-          {fieldLabels[name]}
-        </label>
-
-        <div
-          className={`voice-input-wrapper textarea-wrapper ${
-            isListening ? "field-listening" : ""
-          }`}
-        >
-          <textarea
-            id={name}
-            name={name}
-            value={form[name]}
-            onChange={handleChange}
-            placeholder={placeholder}
-            rows={rows}
-          />
-
-          <button
-            type="button"
-            className={`field-mic textarea-mic ${
-              isListening ? "active" : ""
-            }`}
-            onClick={() =>
-              handleFieldSpeak(name)
-            }
-            aria-label={`Speak for ${fieldLabels[name]}`}
-            title={`Speak for ${fieldLabels[name]}`}
-          >
-            {isListening ? "●" : "🎙"}
-          </button>
-        </div>
-      </div>
-    );
-  };
+  // =====================================================
+  // UI
+  // =====================================================
 
   return (
     <div className="app-shell">
-      <header className="topbar">
-        <div>
-          <div className="brand-row">
-            <div className="brand-icon">FV</div>
 
-            <div>
-              <h1>FormVoice</h1>
-              <p>Voice-powered form filling</p>
-            </div>
+      {/* =================================================
+          HEADER
+      ================================================= */}
+
+      <header className="topbar">
+
+        <div className="brand-row">
+
+          <div className="brand-icon">
+            FV
           </div>
+
+          <div>
+            <h1>FormVoice AI</h1>
+
+            <p>
+              Intelligent voice-powered form filling
+            </p>
+          </div>
+
         </div>
 
         <div className="ready-badge">
-          <span className="ready-dot" />
-          AI Ready
+
+          <span className="ready-dot"></span>
+
+          {getStatusText()}
+
         </div>
+
       </header>
 
-      <main className="dashboard">
-        <section className="left-panel">
-          <div className="voice-card">
-            <div
-              className={`voice-orb ${
-                status === "Listening"
-                  ? "listening"
-                  : ""
-              }`}
-            >
-              <div className="voice-ring ring-one" />
-              <div className="voice-ring ring-two" />
-              <div className="voice-ring ring-three" />
 
-              <div className="mic-symbol">
-                🎙️
-              </div>
+      {/* =================================================
+          MAIN DASHBOARD
+      ================================================= */}
+
+      <main className="dashboard">
+
+        {/* =================================================
+            LEFT PANEL
+        ================================================= */}
+
+        <section className="left-panel">
+
+          {/* VOICE CARD */}
+
+          <div className="voice-card">
+
+            <div className="eyebrow">
+              VOICE INPUT
             </div>
 
-            <span className="eyebrow">
-              VOICE INPUT
-            </span>
-
-            <h2>Tell me your details</h2>
+            <h2>
+              Speak. We'll handle the rest.
+            </h2>
 
             <p>
-              Speak naturally and FormVoice will
-              fill the form for you.
+              Tell FormVoice your information naturally.
+              AI will transcribe your speech and
+              automatically organize it into the form.
             </p>
 
-            <button
-              type="button"
-              className={`main-mic-button ${
-                status === "Listening" &&
-                activeField === null
-                  ? "recording"
-                  : ""
-              }`}
-              onClick={handleMainSpeak}
-              disabled={status === "Processing"}
+
+            {/* MICROPHONE ORB */}
+
+            <div
+              className={
+                isRecording
+                  ? "voice-orb listening"
+                  : "voice-orb"
+              }
             >
-              {status === "Listening" &&
-              activeField === null
-                ? "■ Stop Recording"
-                : "🎙 Speak"}
+
+              <div className="voice-ring ring-one"></div>
+              <div className="voice-ring ring-two"></div>
+              <div className="voice-ring ring-three"></div>
+
+              <div className="mic-symbol">
+                🎤
+              </div>
+
+            </div>
+
+
+            {/* MAIN BUTTON */}
+
+            <button
+              className={
+                isRecording
+                  ? "main-mic-button recording"
+                  : "main-mic-button"
+              }
+              onClick={handleSpeak}
+            >
+
+              {isRecording
+                ? "⏹ Stop Recording"
+                : "🎤 Start Speaking"}
+
             </button>
 
-            {status === "Listening" &&
-              activeField === null && (
-                <div className="wave-bars">
-                  <span />
-                  <span />
-                  <span />
-                  <span />
-                  <span />
-                  <span />
-                  <span />
-                </div>
-              )}
+
+            {/* WAVEFORM */}
+
+            {isRecording && (
+              <div className="wave-bars">
+
+                <span></span>
+                <span></span>
+                <span></span>
+                <span></span>
+                <span></span>
+                <span></span>
+                <span></span>
+
+              </div>
+            )}
+
           </div>
 
+
+          {/* AI ASSISTANT CARD */}
+
           <div className="assistant-card">
+
             <div className="assistant-header">
+
               <div className="assistant-icon">
-                🤖
+                ✨
               </div>
 
               <div>
-                <span>AI ASSISTANT</span>
-                <strong>{status}</strong>
+
+                <span>
+                  AI ASSISTANT
+                </span>
+
+                <strong>
+                  Qwen Intelligence
+                </strong>
+
               </div>
+
             </div>
 
-            <p>{message}</p>
+            <p>
+              Your speech is converted into structured
+              information using AI instead of
+              rule-based field extraction.
+            </p>
+
           </div>
 
-          {transcript && (
-            <div className="transcript-card">
-              <div className="transcript-title">
-                <span>🎧</span>
-                Transcript
-              </div>
 
-              <p>"{transcript}"</p>
+          {/* TRANSCRIPT CARD */}
+
+          <div className="transcript-card">
+
+            <div className="transcript-title">
+              📝 Latest Transcript
             </div>
-          )}
+
+            <p>
+              {transcript ||
+                "Your latest voice transcription will appear here."}
+            </p>
+
+          </div>
+
         </section>
 
+
+        {/* =================================================
+            FORM PANEL
+        ================================================= */}
+
         <section className="form-card">
+
           <div className="form-heading">
+
             <div>
-              <span className="eyebrow">
-                FORM DETAILS
-              </span>
-              <h2>Your Details</h2>
+
+              <div className="eyebrow">
+                SMART FORM
+              </div>
+
+              <h2>
+                Your Information
+              </h2>
+
               <p>
-                Review and edit the information
-                captured from your voice.
+                Review and edit anything before submitting.
               </p>
+
             </div>
 
             <div className="progress-count">
-              {completedFields} / 10
+              {filledFields}/10
             </div>
+
           </div>
 
+
+          {/* PROGRESS */}
+
           <div className="progress-track">
+
             <div
               className="progress-fill"
               style={{
-                width: `${progressPercent}%`,
+                width: `${progress}%`,
               }}
-            />
+            ></div>
+
           </div>
 
           <p className="progress-text">
-            {completedFields} of 10 fields
-            completed
+            {filledFields === 0
+              ? "Start speaking to fill your form"
+              : `${filledFields} of 10 fields completed`}
           </p>
 
+
+          {/* FORM */}
+
           <form onSubmit={handleSubmit}>
+
             <div className="form-grid">
-              {renderInput(
-                "name",
-                "Your full name"
-              )}
 
-              {renderInput(
-                "dob",
-                "DD/MM/YYYY"
-              )}
+              {/* NAME */}
 
-              {renderInput(
-                "phone",
-                "Phone number"
-              )}
+              <div className="field-group">
 
-              {renderInput(
-                "email",
-                "Email address",
-                "email"
-              )}
+                <label>
+                  {fieldLabels.name}
+                </label>
 
-              {renderInput(
-                "application_id",
-                "Application ID"
-              )}
+                <div className="voice-input-wrapper">
 
-              {renderInput(
-                "pin",
-                "PIN code"
-              )}
+                  <input
+                    type="text"
+                    value={form.name}
+                    onChange={(e) =>
+                      handleChange(
+                        "name",
+                        e.target.value
+                      )
+                    }
+                    placeholder="e.g. Anand Kumar"
+                  />
 
-              {renderInput(
-                "city",
-                "City"
-              )}
+                </div>
 
-              {renderInput(
-                "state",
-                "State"
-              )}
+              </div>
 
-              {renderTextarea(
-                "address",
-                "Your address",
-                3
-              )}
 
-              {renderTextarea(
-                "paragraph",
-                "Speak or type your description...",
-                5
-              )}
+              {/* DOB */}
+
+              <div className="field-group">
+
+                <label>
+                  {fieldLabels.dob}
+                </label>
+
+                <div className="voice-input-wrapper">
+
+                  <input
+                    type="text"
+                    value={form.dob}
+                    onChange={(e) =>
+                      handleChange(
+                        "dob",
+                        e.target.value
+                      )
+                    }
+                    placeholder="DD/MM/YYYY"
+                  />
+
+                </div>
+
+              </div>
+
+
+              {/* PHONE */}
+
+              <div className="field-group">
+
+                <label>
+                  {fieldLabels.phone}
+                </label>
+
+                <div className="voice-input-wrapper">
+
+                  <input
+                    type="text"
+                    value={form.phone}
+                    onChange={(e) =>
+                      handleChange(
+                        "phone",
+                        e.target.value
+                      )
+                    }
+                    placeholder="9876543210"
+                  />
+
+                </div>
+
+              </div>
+
+
+              {/* EMAIL */}
+
+              <div className="field-group">
+
+                <label>
+                  {fieldLabels.email}
+                </label>
+
+                <div className="voice-input-wrapper">
+
+                  <input
+                    type="email"
+                    value={form.email}
+                    onChange={(e) =>
+                      handleChange(
+                        "email",
+                        e.target.value
+                      )
+                    }
+                    placeholder="you@example.com"
+                  />
+
+                </div>
+
+              </div>
+
+
+              {/* APPLICATION ID */}
+
+              <div className="field-group">
+
+                <label>
+                  {fieldLabels.application_id}
+                </label>
+
+                <div className="voice-input-wrapper">
+
+                  <input
+                    type="text"
+                    value={form.application_id}
+                    onChange={(e) =>
+                      handleChange(
+                        "application_id",
+                        e.target.value
+                      )
+                    }
+                    placeholder="ABX2047891"
+                  />
+
+                </div>
+
+              </div>
+
+
+              {/* PIN */}
+
+              <div className="field-group">
+
+                <label>
+                  {fieldLabels.pin}
+                </label>
+
+                <div className="voice-input-wrapper">
+
+                  <input
+                    type="text"
+                    value={form.pin}
+                    onChange={(e) =>
+                      handleChange(
+                        "pin",
+                        e.target.value
+                      )
+                    }
+                    placeholder="411007"
+                  />
+
+                </div>
+
+              </div>
+
+
+              {/* ADDRESS */}
+
+              <div className="field-group full-width">
+
+                <label>
+                  {fieldLabels.address}
+                </label>
+
+                <div className="voice-input-wrapper">
+
+                  <input
+                    type="text"
+                    value={form.address}
+                    onChange={(e) =>
+                      handleChange(
+                        "address",
+                        e.target.value
+                      )
+                    }
+                    placeholder="House number, street, area"
+                  />
+
+                </div>
+
+              </div>
+
+
+              {/* CITY */}
+
+              <div className="field-group">
+
+                <label>
+                  {fieldLabels.city}
+                </label>
+
+                <div className="voice-input-wrapper">
+
+                  <input
+                    type="text"
+                    value={form.city}
+                    onChange={(e) =>
+                      handleChange(
+                        "city",
+                        e.target.value
+                      )
+                    }
+                    placeholder="Pune"
+                  />
+
+                </div>
+
+              </div>
+
+
+              {/* STATE */}
+
+              <div className="field-group">
+
+                <label>
+                  {fieldLabels.state}
+                </label>
+
+                <div className="voice-input-wrapper">
+
+                  <input
+                    type="text"
+                    value={form.state}
+                    onChange={(e) =>
+                      handleChange(
+                        "state",
+                        e.target.value
+                      )
+                    }
+                    placeholder="Maharashtra"
+                  />
+
+                </div>
+
+              </div>
+
+
+              {/* PARAGRAPH */}
+
+              <div className="field-group full-width">
+
+                <label>
+                  {fieldLabels.paragraph}
+                </label>
+
+                <div className="voice-input-wrapper">
+
+                  <textarea
+                    value={form.paragraph}
+                    onChange={(e) =>
+                      handleChange(
+                        "paragraph",
+                        e.target.value
+                      )
+                    }
+                    placeholder="Any additional information..."
+                    rows="5"
+                  />
+
+                </div>
+
+              </div>
+
             </div>
 
+
+            {/* ACTIONS */}
+
             <div className="form-actions">
+
               <button
                 type="button"
                 className="secondary-button"
@@ -628,12 +885,17 @@ function App() {
                 type="submit"
                 className="submit-button"
               >
-                Submit Form
+                Submit Form →
               </button>
+
             </div>
+
           </form>
+
         </section>
+
       </main>
+
     </div>
   );
 }
