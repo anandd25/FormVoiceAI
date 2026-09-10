@@ -873,6 +873,7 @@ Do not invent experience.
 Do not use markdown.
 Do not use code fences.
 Do not write anything outside the JSON.
+
 """
         ),
 
@@ -943,6 +944,9 @@ Rules:
 - Make it natural for spoken conversation.
 - Do not number it.
 - Do not explain your reasoning.
+and make sure that you keep it diverse you should not be stucked on single project or skill 
+also ask personal preferences keep it real like interview 
+do not include "can you walk me through" in every question
 
 Return ONLY the question.
 """
