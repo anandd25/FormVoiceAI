@@ -929,4 +929,3 @@ The key idea is simple:
 
 ---
 
-**Important before you put this on GitHub:** replace the Rime placeholders with the **exact model ID, speaker, language, endpoint, audio format, and transport actually used by your application**. The hackathon explicitly requires these details in the README. 
